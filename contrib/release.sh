@@ -19,11 +19,11 @@
 #
 # Note: steps before doing a new release:
 # - update locale:
-#     1. cd /opt/electrum-locale && ./update && push
+#     1. cd /opt/electrum-locale && ./update && git push
 #     2. cd to the submodule dir, and git pull
 #     3. cd .. && git push
 # - update RELEASE-NOTES and version.py
-# - git tag
+# - $ git tag -s $VERSION -m $VERSION
 #
 # -----
 # Then, typical release flow:
