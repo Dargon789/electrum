@@ -33,7 +33,7 @@ import urllib
 import threading
 import hmac
 import stat
-import locale
+from locale import localeconv
 import asyncio
 import urllib.request, urllib.parse, urllib.error
 import builtins
@@ -698,11 +698,7 @@ def format_satoshis_plain(
 # We enforce that we have at least that available.
 assert decimal.getcontext().prec >= 28, f"PyDecimal precision too low: {decimal.getcontext().prec}"
 
-# DECIMAL_POINT = locale.localeconv()['decimal_point']  # type: str
-DECIMAL_POINT = "."
-THOUSANDS_SEP = " "
-assert len(DECIMAL_POINT) == 1, f"DECIMAL_POINT has unexpected len. {DECIMAL_POINT!r}"
-assert len(THOUSANDS_SEP) == 1, f"THOUSANDS_SEP has unexpected len. {THOUSANDS_SEP!r}"
+DECIMAL_POINT = localeconv()['decimal_point']  # type: str
 
 
 def format_satoshis(
@@ -741,9 +737,9 @@ def format_satoshis(
         sign = integer_part[0] if integer_part[0] in ("+", "-") else ""
         if sign == "-":
             integer_part = integer_part[1:]
-        integer_part = "{:,}".format(int(integer_part)).replace(',', THOUSANDS_SEP)
+        integer_part = "{:,}".format(int(integer_part)).replace(',', " ")
         integer_part = sign + integer_part
-        fract_part = THOUSANDS_SEP.join(fract_part[i:i+3] for i in range(0, len(fract_part), 3))
+        fract_part = " ".join(fract_part[i:i+3] for i in range(0, len(fract_part), 3))
     result = integer_part + DECIMAL_POINT + fract_part
     # add leading/trailing whitespaces so that numbers can be aligned in a column
     if whitespaces:
@@ -791,14 +787,14 @@ def format_time(timestamp):
 # Takes a timestamp and returns a string with the approximation of the age
 def age(from_date, since_date = None, target_tz=None, include_seconds=False):
     if from_date is None:
-        return _("Unknown")
+        return "Unknown"
 
     from_date = datetime.fromtimestamp(from_date)
     if since_date is None:
         since_date = datetime.now(target_tz)
 
     td = time_difference(from_date - since_date, include_seconds)
-    return (_("{} ago") if from_date < since_date else _("in {}")).format(td)
+    return td + " ago" if from_date < since_date else "in " + td
 
 
 def time_difference(distance_in_time, include_seconds):
@@ -808,27 +804,27 @@ def time_difference(distance_in_time, include_seconds):
 
     if distance_in_minutes == 0:
         if include_seconds:
-            return _("{} seconds").format(distance_in_seconds)
+            return "%s seconds" % distance_in_seconds
         else:
-            return _("less than a minute")
+            return "less than a minute"
     elif distance_in_minutes < 45:
-        return _("about {} minutes").format(distance_in_minutes)
+        return "%s minutes" % distance_in_minutes
     elif distance_in_minutes < 90:
-        return _("about 1 hour")
+        return "about 1 hour"
     elif distance_in_minutes < 1440:
-        return _("about {} hours").format(round(distance_in_minutes / 60.0))
+        return "about %d hours" % (round(distance_in_minutes / 60.0))
     elif distance_in_minutes < 2880:
-        return _("about 1 day")
+        return "1 day"
     elif distance_in_minutes < 43220:
-        return _("about {} days").format(round(distance_in_minutes / 1440))
+        return "%d days" % (round(distance_in_minutes / 1440))
     elif distance_in_minutes < 86400:
-        return _("about 1 month")
+        return "about 1 month"
     elif distance_in_minutes < 525600:
-        return _("about {} months").format(round(distance_in_minutes / 43200))
+        return "%d months" % (round(distance_in_minutes / 43200))
     elif distance_in_minutes < 1051200:
-        return _("about 1 year")
+        return "about 1 year"
     else:
-        return _("over {} years").format(round(distance_in_minutes / 525600))
+        return "over %d years" % (round(distance_in_minutes / 525600))
 
 mainnet_block_explorers = {
     'Bitupper Explorer': ('https://bitupper.com/en/explorer/bitcoin/',
@@ -1286,65 +1282,6 @@ class TxMinedInfo(NamedTuple):
     header_hash: Optional[str] = None  # hash of block that mined tx
 
 
-class ShortID(bytes):
-
-    def __repr__(self):
-        return f"<ShortID: {format_short_id(self)}>"
-
-    def __str__(self):
-        return format_short_id(self)
-
-    @classmethod
-    def from_components(cls, block_height: int, tx_pos_in_block: int, output_index: int) -> 'ShortID':
-        bh = block_height.to_bytes(3, byteorder='big')
-        tpos = tx_pos_in_block.to_bytes(3, byteorder='big')
-        oi = output_index.to_bytes(2, byteorder='big')
-        return ShortID(bh + tpos + oi)
-
-    @classmethod
-    def from_str(cls, scid: str) -> 'ShortID':
-        """Parses a formatted scid str, e.g. '643920x356x0'."""
-        components = scid.split("x")
-        if len(components) != 3:
-            raise ValueError(f"failed to parse ShortID: {scid!r}")
-        try:
-            components = [int(x) for x in components]
-        except ValueError:
-            raise ValueError(f"failed to parse ShortID: {scid!r}") from None
-        return ShortID.from_components(*components)
-
-    @classmethod
-    def normalize(cls, data: Union[None, str, bytes, 'ShortID']) -> Optional['ShortID']:
-        if isinstance(data, ShortID) or data is None:
-            return data
-        if isinstance(data, str):
-            assert len(data) == 16
-            return ShortID.fromhex(data)
-        if isinstance(data, (bytes, bytearray)):
-            assert len(data) == 8
-            return ShortID(data)
-
-    @property
-    def block_height(self) -> int:
-        return int.from_bytes(self[:3], byteorder='big')
-
-    @property
-    def txpos(self) -> int:
-        return int.from_bytes(self[3:6], byteorder='big')
-
-    @property
-    def output_index(self) -> int:
-        return int.from_bytes(self[6:8], byteorder='big')
-
-
-def format_short_id(short_channel_id: Optional[bytes]):
-    if not short_channel_id:
-        return _('Not yet available')
-    return str(int.from_bytes(short_channel_id[:3], 'big')) \
-        + 'x' + str(int.from_bytes(short_channel_id[3:6], 'big')) \
-        + 'x' + str(int.from_bytes(short_channel_id[6:], 'big'))
-
-
 def make_aiohttp_session(proxy: Optional[dict], headers=None, timeout=None):
     if headers is None:
         headers = {'User-Agent': 'Electrum'}
@@ -1553,13 +1490,9 @@ def is_tor_socks_port(host: str, port: int) -> bool:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.1)
             s.connect((host, port))
-            # mimic "tor-resolve 0.0.0.0".
-            # see https://github.com/spesmilo/electrum/issues/7317#issuecomment-1369281075
-            # > this is a socks5 handshake, followed by a socks RESOLVE request as defined in
-            # > [tor's socks extension spec](https://github.com/torproject/torspec/blob/7116c9cdaba248aae07a3f1d0e15d9dd102f62c5/socks-extensions.txt#L63),
-            # > resolving 0.0.0.0, which being an IP, tor resolves itself without needing to ask a relay.
-            s.send(b'\x05\x01\x00\x05\xf0\x00\x03\x070.0.0.0\x00\x00')
-            if s.recv(1024) == b'\x05\x00\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00':
+            # Tor responds uniquely to HTTP-like requests
+            s.send(b"GET\n")
+            if b"Tor is not an HTTP Proxy" in s.recv(1024):
                 return True
     except socket.error:
         pass
