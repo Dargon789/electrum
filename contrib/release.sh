@@ -39,20 +39,6 @@
 #   - then run WWW_DIR/publish.sh to update website
 # - at least two people need to run WWW_DIR/publish.sh
 #
-# -----
-# Then, typical release flow:
-# - RM runs release.sh
-# - Another SFTPUSER BUILDER runs `$ ./release.sh`
-# - now airlock contains new binaries and two sigs for each
-# - deploy.sh will verify sigs and move binaries across airlock
-# - new binaries are now publicly available on uploadserver, but not linked from website yet
-# - other BUILDERS can now also try to reproduce binaries and open PRs with sigs against spesmilo/electrum-signatures
-#   - these PRs can get merged as they come
-#   - run add_cosigner
-# - after some time, RM can run release_www.sh to create and commit website-update
-#   - then run WWW_DIR/publish.sh to update website
-# - at least two people need to run WWW_DIR/publish.sh
-#
 
 set -e
 
