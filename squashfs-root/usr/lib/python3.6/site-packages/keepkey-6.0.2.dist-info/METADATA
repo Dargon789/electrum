@@ -1,0 +1,25 @@
+Metadata-Version: 2.1
+Name: keepkey
+Version: 6.0.2
+Summary: Python library for communicating with KeepKey Hardware Wallet
+Home-page: https://github.com/keepkey/python-keepkey
+Author: TREZOR and KeepKey
+Author-email: support@keepkey.com
+License: UNKNOWN
+Platform: UNKNOWN
+Classifier: License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Operating System :: Microsoft :: Windows
+Classifier: Operating System :: MacOS :: MacOS X
+Requires-Dist: ecdsa (>=0.9)
+Requires-Dist: protobuf (>=3.0.0)
+Requires-Dist: mnemonic (>=0.8)
+Requires-Dist: hidapi (>=0.7.99.post15)
+Requires-Dist: libusb1 (>=1.6)
+Provides-Extra: ethereum
+Requires-Dist: rlp (>=0.4.4) ; extra == 'ethereum'
+Requires-Dist: ethjsonrpc (>=0.3.0) ; extra == 'ethereum'
+
+UNKNOWN
+
+

@@ -1,0 +1,30 @@
+Metadata-Version: 2.0
+Name: safet
+Version: 0.1.4
+Summary: Python library for communicating with the Archos Safe-T mini (Trezor compatible) Hardware Wallets
+Home-page: https://github.com/archos-safe-t/python-safet
+Author: Trezor - Archos
+Author-email: software@archos.com
+License: UNKNOWN
+Platform: UNKNOWN
+Classifier: License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Operating System :: Microsoft :: Windows
+Classifier: Operating System :: MacOS :: MacOS X
+Classifier: Programming Language :: Python :: 3 :: Only
+Requires-Python: >=3.3
+Provides-Extra: ethereum
+Requires-Dist: click (>=6.2)
+Requires-Dist: ecdsa (>=0.9)
+Requires-Dist: hidapi (>=0.7.99.post20)
+Requires-Dist: libusb1 (>=1.6.4)
+Requires-Dist: mnemonic (>=0.17)
+Requires-Dist: pyblake2 (>=0.9.3)
+Requires-Dist: requests (>=2.4.0)
+Requires-Dist: setuptools (>=19.0)
+Provides-Extra: ethereum
+Requires-Dist: rlp (>=0.6.0); extra == 'ethereum'
+
+UNKNOWN
+
+

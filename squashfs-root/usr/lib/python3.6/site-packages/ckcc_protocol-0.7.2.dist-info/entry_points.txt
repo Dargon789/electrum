@@ -1,0 +1,4 @@
+
+        [console_scripts]
+        ckcc=ckcc.cli:main
+    
