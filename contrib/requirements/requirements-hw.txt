@@ -34,3 +34,4 @@ protobuf>=3.20,<4
 # (pulled in via safet -> click -> colorama)
 colorama<0.4.6
 setuptools>=78.1.1 # not directly required, pinned by Snyk to avoid a vulnerability
+requests>=2.32.4 # not directly required, pinned by Snyk to avoid a vulnerability
