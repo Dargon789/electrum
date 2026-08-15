@@ -12,7 +12,7 @@ import subprocess
 from setuptools import setup, find_packages
 from setuptools.command.install import install
 
-MIN_PYTHON_VERSION = "3.8.0"
+MIN_PYTHON_VERSION = "3.10.0"
 _min_python_version_tuple = tuple(map(int, (MIN_PYTHON_VERSION.split("."))))
 
 
@@ -45,7 +45,7 @@ extras_require = {
     'gui': ['pyqt6'],
     'crypto': ['cryptography>=2.6'],
     'tests': ['pycryptodomex>=3.7', 'cryptography>=2.6', 'pyaes>=0.1a1'],
-    'qml_gui': ['pyqt6', 'Pillow>=8.4.0']
+    'qml_gui': ['pyqt6~=6.10.2', 'pyqt6-qt6~=6.10.2'],  # should be same-ish version as Android build uses?
 }
 # 'full' extra that tries to grab everything an enduser would need (except for libsecp256k1...)
 extras_require['full'] = [pkg for sublist in

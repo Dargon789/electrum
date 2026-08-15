@@ -1,10 +1,10 @@
 #!/bin/bash
 
 PYINSTALLER_REPO="https://github.com/pyinstaller/pyinstaller.git"
-PYINSTALLER_COMMIT="5d7a0449ecea400eccbbb30d5fcef27d72f8f75d"
-# ^ tag "v6.6.0"
+PYINSTALLER_COMMIT="306d4d92580fea7be7ff2c89ba112cdc6f73fac1"
+# ^ tag "v6.13.0"
 
-PYTHON_VERSION=3.11.9
+PYTHON_VERSION=3.12.10
 
 
 # Let's begin!
@@ -35,7 +35,7 @@ else
 fi
 PYTHON_DOWNLOADS="$CACHEDIR/python$PYTHON_VERSION"
 mkdir -p "$PYTHON_DOWNLOADS"
-for msifile in core dev exe lib pip tools; do
+for msifile in core dev exe lib pip; do
     echo "Installing $msifile..."
     download_if_not_exist "$PYTHON_DOWNLOADS/${msifile}.msi" "https://www.python.org/ftp/python/$PYTHON_VERSION/$PYARCH/${msifile}.msi"
     download_if_not_exist "$PYTHON_DOWNLOADS/${msifile}.msi.asc" "https://www.python.org/ftp/python/$PYTHON_VERSION/$PYARCH/${msifile}.msi.asc"
@@ -53,9 +53,7 @@ $WINE_PYTHON -m pip install --no-build-isolation --no-dependencies --no-binary :
 
 
 # copy already built DLLs
-cp "$DLL_TARGET_DIR"/libsecp256k1-*.dll $WINEPREFIX/drive_c/electrum/electrum/ || fail "Could not copy libsecp to its destination"
-cp "$DLL_TARGET_DIR/libzbar-0.dll" $WINEPREFIX/drive_c/electrum/electrum/ || fail "Could not copy libzbar to its destination"
-cp "$DLL_TARGET_DIR/libusb-1.0.dll" $WINEPREFIX/drive_c/electrum/electrum/ || fail "Could not copy libusb to its destination"
+cp "$DLL_TARGET_DIR"/*.dll "$WINEPREFIX/drive_c/electrum/electrum/" || fail "Could not copy DLLs to destination"
 
 
 info "Building PyInstaller."
@@ -95,7 +93,7 @@ info "Building PyInstaller."
     popd
     # sanity check bootloader is there:
     [[ -e "PyInstaller/bootloader/Windows-$PYINST_ARCH-intel/runw.exe" ]] || fail "Could not find runw.exe in target dir!"
-) || fail "PyInstaller build failed"
+)
 info "Installing PyInstaller."
 $WINE_PYTHON -m pip install --no-build-isolation --no-dependencies --no-warn-script-location ./pyinstaller
 

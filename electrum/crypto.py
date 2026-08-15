@@ -84,7 +84,7 @@ else:
 
 
 if not (HAS_CRYPTODOME or HAS_CRYPTOGRAPHY):
-    sys.exit(f"Error: at least one of ('pycryptodomex', 'cryptography') needs to be installed.")
+    raise ImportError(f"Error: at least one of ('pycryptodomex', 'cryptography') needs to be installed.")
 
 
 def version_info() -> Mapping[str, Optional[str]]:
@@ -487,7 +487,7 @@ def ecies_decrypt_message(
     *,
     magic: bytes = b'BIE1',
 ) -> bytes:
-    encrypted = base64.b64decode(encrypted)  # type: bytes
+    encrypted = base64.b64decode(encrypted, validate=True)  # type: bytes
     if len(encrypted) < 85:
         raise Exception('invalid ciphertext: length')
     magic_found = encrypted[:4]

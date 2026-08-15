@@ -1,28 +1,25 @@
 import os
-import unittest
 import json
 from typing import Dict, List
 
-import electrum_ecc as ecc
-
 from electrum import bitcoin
 from electrum.json_db import StoredDict
-from electrum.lnutil import (RevocationStore, get_per_commitment_secret_from_seed, make_offered_htlc,
-                             make_received_htlc, make_commitment, make_htlc_tx_witness, make_htlc_tx_output,
-                             make_htlc_tx_inputs, secret_to_pubkey, derive_blinded_pubkey, derive_privkey,
-                             derive_pubkey, make_htlc_tx, extract_ctn_from_tx, UnableToDeriveSecret,
-                             get_compressed_pubkey_from_bech32,
-                             ScriptHtlc, calc_fees_for_commitment_tx, UpdateAddHtlc, LnFeatures,
-                             ln_compare_features, IncompatibleLightningFeatures, ChannelType,
-                             offered_htlc_trim_threshold_sat, received_htlc_trim_threshold_sat,
-                             ImportedChannelBackupStorage)
+from electrum.lnutil import (
+    RevocationStore, get_per_commitment_secret_from_seed, make_offered_htlc, make_received_htlc, make_commitment,
+    make_htlc_tx_witness, make_htlc_tx_output, make_htlc_tx_inputs, secret_to_pubkey, derive_blinded_pubkey,
+    derive_privkey, derive_pubkey, make_htlc_tx, extract_ctn_from_tx, get_compressed_pubkey_from_bech32,
+    ScriptHtlc, calc_fees_for_commitment_tx, UpdateAddHtlc, LnFeatures, ln_compare_features,
+    IncompatibleLightningFeatures, ChannelType, offered_htlc_trim_threshold_sat, received_htlc_trim_threshold_sat,
+    ImportedChannelBackupStorage, list_enabled_ln_feature_bits, PaymentFeeBudget, LnFeatureContexts
+)
 from electrum.util import bfh, MyEncoder
 from electrum.transaction import Transaction, PartialTransaction, Sighash
 from electrum.lnworker import LNWallet
-from electrum.wallet import restore_wallet_from_text, Standard_Wallet
+from electrum.wallet import Standard_Wallet
 from electrum.simple_config import SimpleConfig
 
 from . import ElectrumTestCase, as_testnet
+from . import restore_wallet_from_text__for_unittest
 from .test_bitcoin import disable_ecdsa_r_value_grinding
 
 
@@ -88,6 +85,7 @@ TEST_HTLCS = [
         'preimage': "0404040404040404040404040404040404040404040404040404040404040404",
     }
 ]
+
 
 class TestLNUtil(ElectrumTestCase):
     def test_shachain_store(self):
@@ -476,7 +474,7 @@ class TestLNUtil(ElectrumTestCase):
         ]
 
         for test in tests:
-            receiver = RevocationStore(StoredDict({}, None, []))
+            receiver = RevocationStore(StoredDict({}, None))
             for insert in test["inserts"]:
                 secret = bytes.fromhex(insert["secret"])
 
@@ -499,7 +497,7 @@ class TestLNUtil(ElectrumTestCase):
 
     def test_shachain_produce_consume(self):
         seed = bitcoin.sha256(b"shachaintest")
-        consumer = RevocationStore(StoredDict({}, None, []))
+        consumer = RevocationStore(StoredDict({}, None))
         for i in range(10000):
             secret = get_per_commitment_secret_from_seed(seed, RevocationStore.START_INDEX - i)
             try:
@@ -509,7 +507,7 @@ class TestLNUtil(ElectrumTestCase):
             if i % 1000 == 0:
                 c1 = consumer
                 s1 = json.dumps(c1.storage, cls=MyEncoder)
-                c2 = RevocationStore(StoredDict(json.loads(s1), None, []))
+                c2 = RevocationStore(StoredDict(json.loads(s1), None))
                 s2 = json.dumps(c2.storage, cls=MyEncoder)
                 self.assertEqual(s1, s2)
 
@@ -803,6 +801,7 @@ class TestLNUtil(ElectrumTestCase):
         # therefore we patch the effective htlc tx weight to result in a finite weight
         from electrum import lnutil
         effective_htlc_tx_weight_original = lnutil.effective_htlc_tx_weight
+
         def effective_htlc_tx_weight_patched(success: bool, has_anchors: bool):
             return lnutil.HTLC_SUCCESS_WEIGHT_ANCHORS if success else lnutil.HTLC_TIMEOUT_WEIGHT_ANCHORS
         lnutil.effective_htlc_tx_weight = effective_htlc_tx_weight_patched
@@ -853,7 +852,7 @@ class TestLNUtil(ElectrumTestCase):
                             cltv_abs=test_htlc['expiry'],
                             htlc_id=None,
                             timestamp=0)
-                        # only add htlcs whose spending transaction creates above-dust ouputs
+                        # only add htlcs whose spending transaction creates above-dust outputs
                         # TODO: should we include this check in make_commitment?
                         if test_htlc['amount'] // 1000 >= (threshold_sat_received if test_htlc['incoming'] else threshold_sat_offered):
                             test_htlcs[test_index] = ScriptHtlc(htlc_script, update_add_htlc)
@@ -920,19 +919,21 @@ class TestLNUtil(ElectrumTestCase):
 
     def test_ln_features_validate_transitive_dependencies(self):
         features = LnFeatures.OPTION_DATA_LOSS_PROTECT_REQ
-        self.assertTrue(features.validate_transitive_dependencies())
+        self.assertTrue(features.validate_transitive_dependencies(context=LnFeatureContexts.INIT))
         features = LnFeatures.PAYMENT_SECRET_OPT
-        self.assertFalse(features.validate_transitive_dependencies())
+        self.assertFalse(features.validate_transitive_dependencies(context=LnFeatureContexts.BOLT11_INVOICE))
         features = LnFeatures.PAYMENT_SECRET_REQ
-        self.assertFalse(features.validate_transitive_dependencies())
+        self.assertFalse(features.validate_transitive_dependencies(context=LnFeatureContexts.BOLT11_INVOICE))
         features = LnFeatures.PAYMENT_SECRET_REQ | LnFeatures.VAR_ONION_REQ
-        self.assertTrue(features.validate_transitive_dependencies())
+        self.assertTrue(features.validate_transitive_dependencies(context=LnFeatureContexts.BOLT11_INVOICE))
         features = LnFeatures.BASIC_MPP_OPT | LnFeatures.PAYMENT_SECRET_REQ
-        self.assertFalse(features.validate_transitive_dependencies())
+        self.assertFalse(features.validate_transitive_dependencies(context=LnFeatureContexts.BOLT11_INVOICE))
         features = LnFeatures.BASIC_MPP_OPT | LnFeatures.PAYMENT_SECRET_REQ | LnFeatures.VAR_ONION_OPT
-        self.assertTrue(features.validate_transitive_dependencies())
+        self.assertTrue(features.validate_transitive_dependencies(context=LnFeatureContexts.BOLT11_INVOICE))
         features = LnFeatures.BASIC_MPP_OPT | LnFeatures.PAYMENT_SECRET_REQ | LnFeatures.VAR_ONION_REQ
-        self.assertTrue(features.validate_transitive_dependencies())
+        self.assertTrue(features.validate_transitive_dependencies(context=LnFeatureContexts.BOLT11_INVOICE))
+        features = LnFeatures.BASIC_MPP_OPT
+        self.assertTrue(features.validate_transitive_dependencies(context=LnFeatureContexts.BOLT12_INVOICE))
 
     def test_ln_features_for_init_message(self):
         features = LnFeatures.OPTION_DATA_LOSS_PROTECT_REQ
@@ -950,23 +951,27 @@ class TestLNUtil(ElectrumTestCase):
         features = LnFeatures.BASIC_MPP_OPT | LnFeatures.PAYMENT_SECRET_REQ | LnFeatures.VAR_ONION_REQ
         self.assertEqual(features, features.for_init_message())
 
-    def test_ln_features_for_invoice(self):
+    def test_ln_features_for_bolt11_invoice(self):
         features = LnFeatures.OPTION_DATA_LOSS_PROTECT_REQ
-        self.assertEqual(LnFeatures(0), features.for_invoice())
+        self.assertEqual(LnFeatures(0), features.for_bolt11_invoice())
         features = LnFeatures.PAYMENT_SECRET_OPT
-        self.assertEqual(features, features.for_invoice())
+        self.assertEqual(features, features.for_bolt11_invoice())
         features = LnFeatures.PAYMENT_SECRET_REQ
-        self.assertEqual(features, features.for_invoice())
+        self.assertEqual(features, features.for_bolt11_invoice())
         features = LnFeatures.PAYMENT_SECRET_REQ | LnFeatures.VAR_ONION_REQ
-        self.assertEqual(features, features.for_invoice())
+        self.assertEqual(features, features.for_bolt11_invoice())
         features = LnFeatures.BASIC_MPP_OPT | LnFeatures.PAYMENT_SECRET_REQ | LnFeatures.OPTION_DATA_LOSS_PROTECT_REQ
         self.assertEqual(LnFeatures.BASIC_MPP_OPT | LnFeatures.PAYMENT_SECRET_REQ,
-                         features.for_invoice())
+                         features.for_bolt11_invoice())
         features = LnFeatures.BASIC_MPP_OPT | LnFeatures.PAYMENT_SECRET_REQ | LnFeatures.VAR_ONION_OPT | LnFeatures.OPTION_DATA_LOSS_PROTECT_REQ
         self.assertEqual(LnFeatures.BASIC_MPP_OPT | LnFeatures.PAYMENT_SECRET_REQ | LnFeatures.VAR_ONION_OPT,
-                         features.for_invoice())
+                         features.for_bolt11_invoice())
         features = LnFeatures.BASIC_MPP_OPT | LnFeatures.PAYMENT_SECRET_REQ | LnFeatures.VAR_ONION_REQ
-        self.assertEqual(features, features.for_invoice())
+        self.assertEqual(features, features.for_bolt11_invoice())
+
+    def test_ln_features_for_bolt12_invoice(self):
+        features = LnFeatures.BASIC_MPP_OPT | LnFeatures.PAYMENT_SECRET_REQ | LnFeatures.VAR_ONION_OPT | LnFeatures.OPTION_DATA_LOSS_PROTECT_REQ
+        self.assertEqual(LnFeatures.BASIC_MPP_OPT, features.for_bolt12_invoice())
 
     def test_ln_compare_features(self):
         f1 = LnFeatures.OPTION_DATA_LOSS_PROTECT_REQ | LnFeatures.OPTION_DATA_LOSS_PROTECT_OPT
@@ -1007,6 +1012,10 @@ class TestLNUtil(ElectrumTestCase):
                          LnFeatures.OPTION_DATA_LOSS_PROTECT_REQ |
                          LnFeatures.VAR_ONION_OPT,
                          ln_compare_features(f2, f1))
+
+    def test_list_enabled_ln_feature_bits(self):
+        self.assertEqual((0, 2, 6), list_enabled_ln_feature_bits(77))
+        self.assertEqual((), list_enabled_ln_feature_bits(0))
 
     def test_ln_features_supports(self):
         f_null = LnFeatures(0)
@@ -1051,23 +1060,57 @@ class TestLNUtil(ElectrumTestCase):
             None,
             LNWallet._decode_channel_update_msg(bytes.fromhex("0101") + msg_without_prefix))
 
-    def test_channel_type(self):
-        # test compliance and non compliance with LN features
-        features = LnFeatures(LnFeatures.BASIC_MPP_OPT | LnFeatures.OPTION_STATIC_REMOTEKEY_OPT)
-        self.assertTrue(ChannelType.OPTION_STATIC_REMOTEKEY.complies_with_features(features))
+    def test_channel_type__complies_with_features(self):
+        """test compliance and-non compliance with LN features"""
+        # non-cflag-related peer_features should be ignored (e.g. BASIC_MPP_REQ):
+        pfeatures = LnFeatures(LnFeatures.BASIC_MPP_REQ | LnFeatures.OPTION_STATIC_REMOTEKEY_OPT)
+        ctype = ChannelType.OPTION_STATIC_REMOTEKEY
+        self.assertTrue(ctype.complies_with_features(pfeatures))
 
-        features = LnFeatures(LnFeatures.BASIC_MPP_OPT | LnFeatures.OPTION_TRAMPOLINE_ROUTING_OPT_ELECTRUM)
-        self.assertFalse(ChannelType.OPTION_STATIC_REMOTEKEY.complies_with_features(features))
+        # SRK missing from pfeatures:
+        pfeatures = LnFeatures(LnFeatures.BASIC_MPP_REQ | LnFeatures.OPTION_TRAMPOLINE_ROUTING_OPT_ELECTRUM)
+        ctype = ChannelType.OPTION_STATIC_REMOTEKEY
+        self.assertFalse(ctype.complies_with_features(pfeatures))
 
-        # ignore unknown channel types
-        channel_type = ChannelType(0b10000000001000000000010).discard_unknown_and_check()
-        self.assertEqual(ChannelType(0b10000000001000000000000), channel_type)
+        # ANCHORS missing from pfeatures:
+        pfeatures = LnFeatures(LnFeatures.BASIC_MPP_REQ | LnFeatures.OPTION_STATIC_REMOTEKEY_OPT)
+        ctype = ChannelType.OPTION_STATIC_REMOTEKEY | ChannelType.OPTION_ANCHORS
+        self.assertFalse(ctype.complies_with_features(pfeatures))
+
+        # SRK channel_type still allowed, even though ANCHORS has been negotiated:
+        pfeatures = LnFeatures(LnFeatures.BASIC_MPP_REQ | LnFeatures.OPTION_STATIC_REMOTEKEY_OPT | LnFeatures.OPTION_ANCHORS_OPT)
+        ctype = ChannelType.OPTION_STATIC_REMOTEKEY
+        self.assertTrue(ctype.complies_with_features(pfeatures))
+        # same, *even if* ANCHORS is set to REQ. OPT or REQ no longer matters after negotiation finishes:
+        pfeatures = LnFeatures(LnFeatures.BASIC_MPP_REQ | LnFeatures.OPTION_STATIC_REMOTEKEY_OPT | LnFeatures.OPTION_ANCHORS_REQ)
+        ctype = ChannelType.OPTION_STATIC_REMOTEKEY
+        self.assertTrue(ctype.complies_with_features(pfeatures))
+
+        # ANCHORS ctype allowed if pfeatures are correctly negotiated:
+        pfeatures = LnFeatures(LnFeatures.BASIC_MPP_REQ | LnFeatures.OPTION_STATIC_REMOTEKEY_OPT | LnFeatures.OPTION_ANCHORS_OPT)
+        ctype = ChannelType.OPTION_STATIC_REMOTEKEY | ChannelType.OPTION_ANCHORS
+        self.assertTrue(ctype.complies_with_features(pfeatures))
+        # again, OPT or REQ does not matter:
+        pfeatures = LnFeatures(LnFeatures.BASIC_MPP_REQ | LnFeatures.OPTION_STATIC_REMOTEKEY_OPT | LnFeatures.OPTION_ANCHORS_REQ)
+        ctype = ChannelType.OPTION_STATIC_REMOTEKEY | ChannelType.OPTION_ANCHORS
+        self.assertTrue(ctype.complies_with_features(pfeatures))
+
+    def test_to_tlv_bytes(self):
+        features = LnFeatures.OPTION_DATA_LOSS_PROTECT_REQ
+        self.assertEqual(features.to_tlv_bytes(), bfh('01'))
+        features = LnFeatures.OPTION_ROUTE_BLINDING_OPT
+        self.assertEqual(features.to_tlv_bytes(), bfh('02000000'))
+        features = LnFeatures.OPTION_DATA_LOSS_PROTECT_REQ |\
+            LnFeatures.OPTION_ROUTE_BLINDING_OPT |\
+            LnFeatures.BASIC_MPP_OPT
+        self.assertEqual(features.to_tlv_bytes(), bfh('02020001'))
+        self.assertEqual(LnFeatures(0).to_tlv_bytes(), b'')
 
     @as_testnet
     async def test_decode_imported_channel_backup_v0(self):
         encrypted_cb = "channel_backup:Adn87xcGIs9H2kfp4VpsOaNKWCHX08wBoqq37l1cLYKGlJamTeoaLEwpJA81l1BXF3GP/mRxqkY+whZG9l51G8izIY/kmMSvnh0DOiZEdwaaT/1/MwEHfsEomruFqs+iW24SFJPHbMM7f80bDtIxcLfZkKmgcKBAOlcqtq+dL3U3yH74S8BDDe2L4snaxxpCjF0JjDMBx1UR/28D+QlIi+lbvv1JMaCGXf+AF1+3jLQf8+lVI+rvFdyArws6Ocsvjf+ANQeSGUwW6Nb2xICQcMRgr1DO7bO4pgGu408eYRr2v3ayJBVtnKwSwd49gF5SDSjTDAO4CCM0uj9H5RxyzH7fqotkd9J80MBr84RiBXAeXKz+Ap8608/FVqgQ9BOcn6LhuAQdE5zXpmbQyw5jUGkPvHuseR+rzthzncy01odUceqTNg=="
         config = SimpleConfig({'electrum_path': self.electrum_path})
-        d = restore_wallet_from_text("9dk", path=None, gap_limit=2, config=config)
+        d = restore_wallet_from_text__for_unittest("9dk", path=None, config=config)
         wallet1 = d['wallet']  # type: Standard_Wallet
         decoded_cb = ImportedChannelBackupStorage.from_encrypted_str(encrypted_cb, password=wallet1.get_fingerprint())
         self.assertEqual(
@@ -1086,6 +1129,7 @@ class TestLNUtil(ElectrumTestCase):
                 remote_payment_pubkey=bfh('02a1bbc818e2e88847016a93c223eb4adef7bb8becb3709c75c556b6beb3afe7bd'),
                 remote_revocation_pubkey=bfh('022f28b7d8d1f05768ada3df1b0966083b8058e1e7197c57393e302ec118d7f0ae'),
                 local_payment_pubkey=None,
+                multisig_funding_privkey=None,
             ),
             decoded_cb,
         )
@@ -1094,7 +1138,7 @@ class TestLNUtil(ElectrumTestCase):
     async def test_decode_imported_channel_backup_v1(self):
         encrypted_cb = "channel_backup:AVYIedu0qSLfY2M2bBxF6dA4RAxcmobp+3h9mxALWWsv5X7hhNg0XYOKNd11FE6BJOZgZnIZ4CCAlHtLNj0/9S5GbNhbNZiQXxeHMwC1lHvtjawkwSejIJyOI52DkDFHBAGZRd4fJjaPJRHnUizWfySVR4zjd08lTinpoIeL7C7tXBW1N6YqceqV7RpeoywlBXJtFfCCuw0hnUKgq3SMlBKapkNAIgGrg15aIHNcYeENxCxr5FD1s7DIwFSECqsBVnu/Ogx2oii8BfuxqJq8vuGq4Ib/BVaSVtdb2E1wklAor/CG0p9Fg9mFWND98JD+64nz9n/knPFFyHxTXErn+ct3ZcStsLYynWKUIocgu38PtzCJ7r5ivqOw4O49fbbzdjcgMUGklPYxjuinETneCo+dCPa1uepOGTqeOYmnjVYtYZYXOlWV1F5OtNoM7MwwJjAbz84="
         config = SimpleConfig({'electrum_path': self.electrum_path})
-        d = restore_wallet_from_text("9dk", path=None, gap_limit=2, config=config)
+        d = restore_wallet_from_text__for_unittest("9dk", path=None, config=config)
         wallet1 = d['wallet']  # type: Standard_Wallet
         decoded_cb = ImportedChannelBackupStorage.from_encrypted_str(encrypted_cb, password=wallet1.get_fingerprint())
         self.assertEqual(
@@ -1113,6 +1157,37 @@ class TestLNUtil(ElectrumTestCase):
                 remote_payment_pubkey=bfh('02a1bbc818e2e88847016a93c223eb4adef7bb8becb3709c75c556b6beb3afe7bd'),
                 remote_revocation_pubkey=bfh('022f28b7d8d1f05768ada3df1b0966083b8058e1e7197c57393e302ec118d7f0ae'),
                 local_payment_pubkey=bfh('0308d686712782a44b0cef220485ad83dae77853a5bf8501a92bb79056c9dcb25a'),
+                multisig_funding_privkey=None,
             ),
             decoded_cb,
         )
+
+    async def test_payment_fee_budget(self):
+        config = SimpleConfig()
+        # test value above cutoff
+        invoice_amount_msat = 1_000_000 * 1000
+        budget = PaymentFeeBudget.from_invoice_amount(
+            invoice_amount_msat=invoice_amount_msat,
+            config=config,
+        )
+        reversed_fee_msat = PaymentFeeBudget.reverse_from_total_amount(
+            total_amount_msat=invoice_amount_msat + budget.fee_msat,
+            config=config,
+        )
+        self.assertGreater(budget.fee_msat, config.LIGHTNING_PAYMENT_FEE_CUTOFF_MSAT)
+        self.assertEqual(reversed_fee_msat, budget.fee_msat)
+
+        # test value below cutoff
+        invoice_amount_msat = 1000
+        budget = PaymentFeeBudget.from_invoice_amount(
+            invoice_amount_msat=invoice_amount_msat,
+            config=config,
+        )
+        reversed_fee_msat = PaymentFeeBudget.reverse_from_total_amount(
+            total_amount_msat=invoice_amount_msat + budget.fee_msat,
+            config=config,
+        )
+        self.assertEqual(budget.fee_msat, config.LIGHTNING_PAYMENT_FEE_CUTOFF_MSAT)
+        self.assertEqual(reversed_fee_msat, budget.fee_msat)
+
+

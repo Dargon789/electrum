@@ -29,8 +29,10 @@ Item {
 
     property color mutedForeground: 'gray' //Qt.lighter(Material.background, 2)
     property color darkerBackground: Qt.darker(Material.background, 1.20)
-    property color lighterBackground: Qt.lighter(Material.background, 1.10)
     property color darkerDialogBackground: Qt.darker(Material.dialogColor, 1.20)
+    property color highlightBackground: Qt.lighter(Material.background, 1.30)
+    property color dialogColor: Material.dialogColor
+    property color seedTextAreaBackground: Qt.darker(darkerDialogBackground, 1.20)
     property color notificationBackground: Qt.lighter(Material.background, 1.5)
 
     property color colorCredit: "#ff80ff80"
@@ -44,6 +46,7 @@ Item {
     property color colorValidBackground: '#ff008000'
     property color colorInvalidBackground: '#ff800000'
     property color colorAcceptable: '#ff8080ff'
+    property color colorOk: colorDone
 
     property color colorLightningLocal: "#6060ff"
     property color colorLightningLocalReserve: "#0000a0"
@@ -68,6 +71,8 @@ Item {
     property color colorAddressUsedWithBalance: Qt.rgba(0.75,0.75,0.75,1)
     property color colorAddressFrozen: Qt.rgba(0.5,0.5,1,1)
     property color colorAddressBilling: "#8cb3f2"
+    property color colorAddressSwap: colorAddressBilling
+    property color colorAddressAccounting: "#ff9b45"
 
     function colorAlpha(baseColor, alpha) {
         return Qt.rgba(baseColor.r, baseColor.g, baseColor.b, alpha)

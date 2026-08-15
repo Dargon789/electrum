@@ -6,9 +6,11 @@ from PyQt6.QtCore import Qt, QAbstractListModel, QModelIndex
 
 from electrum.logging import get_logger
 from electrum.util import Satoshis, format_time
-from electrum.invoices import BaseInvoice, PR_EXPIRED, LN_EXPIRY_NEVER, Invoice, Request
+from electrum.invoices import BaseInvoice, PR_EXPIRED, LN_EXPIRY_NEVER, Invoice, Request, PR_PAID
 
-from .util import QtEventListener, qt_event_listener, status_update_timer_interval
+from electrum.gui.common_qt.util import QtEventListener, qt_event_listener
+
+from .util import status_update_timer_interval
 from .qetypes import QEAmount
 
 if TYPE_CHECKING:
@@ -132,7 +134,7 @@ class QEAbstractInvoiceListModel(QAbstractListModel):
             item['address'] = ''
         item['date'] = format_time(item['timestamp'])
         item['amount'] = QEAmount(from_invoice=invoice)
-        item['onchain_fallback'] = invoice.is_lightning() and invoice.get_address()
+        item['onchain_fallback'] = invoice.is_lightning() and bool(invoice.get_address())
 
         return item
 
@@ -247,4 +249,7 @@ class QERequestListModel(QEAbstractInvoiceListModel, QtEventListener):
 
     @pyqtSlot(str, int)
     def updateRequest(self, key, status):
-        self.updateInvoice(key, status)
+        if status == PR_PAID:
+            self.delete_invoice(key)
+        else:
+            self.updateInvoice(key, status)

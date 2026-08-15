@@ -9,10 +9,15 @@ Dialog {
     property bool allowClose: true
     property string iconSource
     property bool resizeWithKeyboard: true
+    // inheriting classes can set needsSystemBarPadding this false to disable padding
+    property bool needsSystemBarPadding: true
 
     property bool _result: false
     // workaround: remember opened state, to inhibit closed -> closed event
     property bool _wasOpened: false
+
+    // Add bottom padding for Android navigation bar if needed
+    bottomPadding: needsSystemBarPadding && app.keyboardFreeZone.state != 'visible' ? app.navigationBarHeight : 0
 
     // called to finally close dialog after checks by onClosing handler in main.qml
     function doClose() {
@@ -65,6 +70,13 @@ Dialog {
     header: ColumnLayout {
         spacing: 0
 
+        // Add top padding for status bar on Android when using edge-to-edge
+        Item {
+            visible: needsSystemBarPadding && app.statusBarHeight > 0
+            Layout.fillWidth: true
+            Layout.preferredHeight: app.statusBarHeight
+        }
+
         RowLayout {
             spacing: 0
 
@@ -94,10 +106,10 @@ Dialog {
 
         Rectangle {
             Layout.fillWidth: true
-            Layout.leftMargin: constants.paddingXXSmall
-            Layout.rightMargin: constants.paddingXXSmall
-            height: 1
-            color: Qt.rgba(0,0,0,0.5)
+            Layout.leftMargin: constants.paddingSmall
+            Layout.rightMargin: constants.paddingSmall
+            Layout.preferredHeight: 2
+            color: constants.darkerDialogBackground
         }
     }
 

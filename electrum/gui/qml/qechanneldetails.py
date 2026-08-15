@@ -2,19 +2,20 @@ import threading
 from enum import IntEnum
 from typing import Optional, TYPE_CHECKING
 
-from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, pyqtEnum
+from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, pyqtEnum, QVariant
 
 from electrum.i18n import _
 from electrum.gui import messages
 from electrum.logging import get_logger
 from electrum.lnutil import LOCAL, REMOTE
 from electrum.lnchannel import ChanCloseOption, ChannelState, AbstractChannel, Channel, ChannelBackup
-from electrum.util import format_short_id
+from electrum.util import format_short_id, event_listener
+
+from electrum.gui.common_qt.util import QtEventListener
 
 from .auth import AuthMixin, auth_protect
 from .qewallet import QEWallet
 from .qetypes import QEAmount
-from .util import QtEventListener, event_listener
 
 if TYPE_CHECKING:
     from electrum.wallet import Abstract_Wallet
@@ -60,12 +61,13 @@ class QEChannelDetails(AuthMixin, QObject, QtEventListener):
         self.unregister_callbacks()
 
     walletChanged = pyqtSignal()
-    @pyqtProperty(QEWallet, notify=walletChanged)
+    @pyqtProperty(QVariant, notify=walletChanged)
     def wallet(self) -> QEWallet:
         return self._wallet
 
     @wallet.setter
     def wallet(self, wallet: QEWallet):
+        assert wallet is None or isinstance(wallet, QEWallet)
         if self._wallet != wallet:
             self._wallet = wallet
             self.walletChanged.emit()
@@ -94,7 +96,7 @@ class QEChannelDetails(AuthMixin, QObject, QtEventListener):
     def name(self) -> str:
         if not self._channel:
             return ''
-        return self._wallet.wallet.lnworker.get_node_alias(self._channel.node_id) or ''
+        return self._wallet.wallet.lnworker.lnpeermgr.get_node_alias(self._channel.node_id) or ''
 
     @pyqtProperty(str, notify=channelChanged)
     def pubkey(self) -> str:
@@ -326,10 +328,4 @@ class QEChannelDetails(AuthMixin, QObject, QtEventListener):
 
     @pyqtSlot(result=str)
     def channelBackupHelpText(self):
-        return ' '.join([
-            _("Channel backups can be imported in another instance of the same wallet."),
-            _("In the Electrum mobile app, use the 'Send' button to scan this QR code."),
-            '\n\n',
-            _("Please note that channel backups cannot be used to restore your channels."),
-            _("If you lose your wallet file, the only thing you can do with a backup is to request your channel to be closed, so that your funds will be sent on-chain."),
-        ])
+        return messages.MSG_LN_EXPLAIN_SCB_BACKUPS
