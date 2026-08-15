@@ -10,8 +10,9 @@ import "controls"
 ElDialog {
     id: dialog
 
-    property Invoice invoice
+    property var invoice  // type Invoice
     property bool payImmediately: false
+    property string broadcastTxid
 
     signal doPay
     signal invoiceAmountChanged
@@ -23,7 +24,7 @@ ElDialog {
 
     property bool _canMax: invoice.invoiceType == Invoice.OnchainInvoice
 
-    property Amount _invoice_amount: invoice.amount
+    property var _invoice_amount: invoice.amount  // type: Amount
 
     ColumnLayout {
         anchors.fill: parent
@@ -62,8 +63,13 @@ ElDialog {
                                 : invoice.status == Invoice.Paid
                                     ? InfoTextArea.IconStyle.Done
                                     : invoice.status == Invoice.Unpaid && invoice.expiration > 0
-                                        ? InfoTextArea.IconStyle.Pending
+                                        ? invoice.canPay
+                                            ? InfoTextArea.IconStyle.Pending
+                                            : invoice.userinfoStatus == Invoice.Warning
+                                                ? InfoTextArea.IconStyle.Warn
+                                                : InfoTextArea.IconStyle.Error
                                         : InfoTextArea.IconStyle.Info
+                    backgroundColor: constants.darkerDialogBackground
                 }
 
                 Label {
@@ -74,7 +80,7 @@ ElDialog {
                     color: Material.accentColor
                 }
 
-                TextHighlightPane {
+                DialogHighlightPane {
                     Layout.columnSpan: 2
                     Layout.fillWidth: true
                     visible: invoice.invoiceType == Invoice.OnchainInvoice
@@ -111,7 +117,7 @@ ElDialog {
                     color: Material.accentColor
                 }
 
-                TextHighlightPane {
+                DialogHighlightPane {
                     Layout.columnSpan: 2
                     Layout.fillWidth: true
 
@@ -134,7 +140,7 @@ ElDialog {
                     color: Material.accentColor
                 }
 
-                TextHighlightPane {
+                DialogHighlightPane {
                     id: amountContainer
 
                     Layout.columnSpan: 2
@@ -142,6 +148,7 @@ ElDialog {
                     Layout.alignment: Qt.AlignHCenter
 
                     leftPadding: constants.paddingXLarge
+                    rightPadding: constants.paddingXLarge
 
                     property bool editmode: false
 
@@ -177,7 +184,9 @@ ElDialog {
                                 font.pixelSize: constants.fontSizeXLarge
                                 font.family: FixedFont
                                 font.bold: true
-                                text: Config.formatSats(invoice.amount, false)
+                                text: invoice.invoiceType == Invoice.LightningInvoice
+                                    ? Config.formatMilliSats(invoice.amount, false)
+                                    : Config.formatSats(invoice.amount, false)
                             }
 
                             Label {
@@ -192,7 +201,6 @@ ElDialog {
                                 id: fiatValue
                                 Layout.alignment: Qt.AlignRight
                                 visible: Daemon.fx.enabled && !_invoice_amount.isMax && !_invoice_amount.isEmpty
-                                text: Daemon.fx.fiatValue(invoice.amount, false)
                                 font.pixelSize: constants.fontSizeMedium
                                 color: constants.mutedForeground
                             }
@@ -216,10 +224,24 @@ ElDialog {
 
                             BtcField {
                                 id: amountBtc
+                                Layout.preferredWidth: amountFontMetrics.advanceWidth('0') * 14 + leftPadding + rightPadding
                                 fiatfield: amountFiat
-                                enabled: !amountMax.checked
+                                readOnly: amountMax.checked
+                                msatPrecision: invoice.invoiceType == Invoice.LightningInvoice
+                                color: readOnly
+                                    ? Material.accentColor
+                                    : Material.foreground
                                 onTextAsSatsChanged: {
-                                    invoice.amountOverride = textAsSats
+                                    if (!amountMax.checked)
+                                        invoice.amountOverride.copyFrom(textAsSats)
+                                }
+                                Connections {
+                                    target: invoice.amountOverride
+                                    function onSatsIntChanged() {
+                                        console.log('amountOverride satsIntChanged, sats=' + invoice.amountOverride.satsInt)
+                                        if (amountMax.checked)  // amountOverride updated by max amount estimate
+                                            amountBtc.text = Config.formatSatsForEditing(invoice.amountOverride.satsInt)
+                                    }
                                 }
                             }
 
@@ -239,23 +261,49 @@ ElDialog {
                                 visible: _canMax
                                 checked: false
                                 onCheckedChanged: {
-                                    if (activeFocus)
+                                    if (activeFocus) {
                                         invoice.amountOverride.isMax = checked
+                                        if (checked) {
+                                            maxAmountMessage.text = ''
+                                            invoice.updateMaxAmount()
+                                        }
+                                    }
                                 }
                             }
 
                             FiatField {
                                 id: amountFiat
+                                Layout.preferredWidth: amountFontMetrics.advanceWidth('0') * 14 + leftPadding + rightPadding
                                 btcfield: amountBtc
-                                visible: Daemon.fx.enabled && !amountMax.checked
-                                enabled: !amountMax.checked
+                                visible: Daemon.fx.enabled
+                                readOnly: amountMax.checked
+                                color: readOnly
+                                    ? Material.accentColor
+                                    : Material.foreground
                             }
 
                             Label {
                                 Layout.columnSpan: 2
-                                visible: Daemon.fx.enabled && !amountMax.checked
+                                visible: Daemon.fx.enabled
                                 text: Daemon.fx.fiatCurrency
                                 color: Material.accentColor
+                            }
+
+                            InfoTextArea {
+                                Layout.topMargin: constants.paddingMedium
+                                Layout.fillWidth: true
+                                Layout.columnSpan: 3
+                                id: maxAmountMessage
+                                visible: amountMax.checked && text
+                                compact: true
+                                backgroundColor: constants.darkerDialogBackground
+
+                                Connections {
+                                    target: invoice
+                                    function onMaxAmountMessage(message) {
+                                        maxAmountMessage.text = message
+                                    }
+                                }
                             }
                         }
                     }
@@ -272,11 +320,11 @@ ElDialog {
                     Layout.columnSpan: 2
                     Layout.topMargin: constants.paddingSmall
                     visible: invoice.invoiceType == Invoice.LightningInvoice
-                    text: qsTr('Remote Pubkey')
+                    text: qsTr('Recipient Pubkey')
                     color: Material.accentColor
                 }
 
-                TextHighlightPane {
+                DialogHighlightPane {
                     Layout.columnSpan: 2
                     Layout.fillWidth: true
 
@@ -314,7 +362,7 @@ ElDialog {
                     color: Material.accentColor
                 }
 
-                TextHighlightPane {
+                DialogHighlightPane {
                     Layout.columnSpan: 2
                     Layout.fillWidth: true
 
@@ -357,7 +405,7 @@ ElDialog {
                     visible: 'r' in invoice.lnprops && invoice.lnprops.r.length
                     model: invoice.lnprops.r
 
-                    TextHighlightPane {
+                    DialogHighlightPane {
                         Layout.columnSpan: 2
                         Layout.fillWidth: true
 
@@ -384,7 +432,7 @@ ElDialog {
                     color: Material.accentColor
                 }
 
-                TextHighlightPane {
+                DialogHighlightPane {
                     Layout.columnSpan: 2
                     Layout.fillWidth: true
                     visible: invoice.invoiceType == Invoice.LightningInvoice && invoice.address
@@ -414,7 +462,7 @@ ElDialog {
             }
         }
 
-        ButtonContainer {
+        DialogButtonContainer {
             Layout.fillWidth: true
 
             FlatButton {
@@ -425,11 +473,14 @@ ElDialog {
                 enabled: !invoice.isSaved && invoice.canSave
                 onClicked: {
                     if (invoice.amount.isEmpty) {
-                        invoice.amountOverride = amountMax.checked ? MAX : Config.unitsToSats(amountBtc.text)
+                        invoice.amountOverride = Config.unitsToSats(amountBtc.text)
+                        if (amountMax.checked)
+                            invoice.amountOverride.isMax = true
                     }
-                    invoice.saveInvoice()
-                    app.stack.push(Qt.resolvedUrl('Invoices.qml'))
-                    dialog.close()
+                    if (invoice.saveInvoice()) {
+                        app.stack.push(Qt.resolvedUrl('Invoices.qml'))
+                        dialog.close()
+                    }
                 }
             }
             FlatButton {
@@ -440,11 +491,9 @@ ElDialog {
                 enabled: invoice.invoiceType != Invoice.Invalid && invoice.canPay
                 onClicked: {
                     if (invoice.amount.isEmpty) {
-                        invoice.amountOverride = amountMax.checked ? MAX : Config.unitsToSats(amountBtc.text)
-                    }
-                    if (!invoice.isSaved) {
-                        // save invoice if newly parsed
-                        invoice.saveInvoice()
+                        invoice.amountOverride = Config.unitsToSats(amountBtc.text)
+                        if (amountMax.checked)
+                            invoice.amountOverride.isMax = true
                     }
                     doPay() // only signal here
                 }
@@ -453,19 +502,45 @@ ElDialog {
 
     }
 
+    function setFiatValue() {
+        fiatValue.text = Daemon.fx.fiatValue(invoice.amount, false)
+    }
+
     Component.onCompleted: {
-        if (invoice.amount.isEmpty && !invoice.status == Invoice.Expired) {
+        if (invoice.amount.isEmpty && invoice.status != Invoice.Expired) {
             amountContainer.editmode = true
         } else if (invoice.amount.isMax) {
             amountMax.checked = true
         }
+        setFiatValue()
         if (payImmediately) {
             if (invoice.canPay) {
-                if (!invoice.isSaved) {
-                    invoice.saveInvoice()
-                }
                 doPay()
             }
         }
+    }
+
+    Connections {
+        target: Daemon.currentWallet
+        function onBroadcastSucceeded(txid) {
+            if (dialog.broadcastTxid == txid) {
+                // our txid was broadcast successfully, close invoicedialog and show success popup
+                dialog.close()
+                var successdialog = app.messageDialog.createObject(mainView, {
+                    text: qsTr('Payment sent.')
+                })
+                successdialog.open()
+            }
+        }
+    }
+
+    Connections {
+        target: Daemon.fx
+        function onQuotesUpdated() { setFiatValue() }
+    }
+
+    FontMetrics {
+        id: amountFontMetrics
+        font: amountBtc.font
     }
 }

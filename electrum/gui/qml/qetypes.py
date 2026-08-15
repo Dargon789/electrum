@@ -3,16 +3,21 @@ from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject
 from electrum.logging import get_logger
 from electrum.i18n import _
 
-# container for satoshi amounts that can be passed around more
-# easily between python, QML-property and QML-javascript contexts
-# QML 'int' is 32 bit signed, so overflows on satoshi amounts
-# QML 'quint64' and 'qint64' can be used, but this breaks
-# down when passing through property bindings
-# should also capture millisats amounts and MAX/'!' indicators
-# and (unformatted) string representations
-
 
 class QEAmount(QObject):
+    """Container for bitcoin amounts that can be passed around more
+       easily between python, QML-property and QML-javascript contexts.
+       Note: millisat and sat amounts are not synchronized!
+
+       QML type 'int' in property definitions is 32 bit signed, so will overflow easily
+       on (milli)satoshi amounts! 'int' in QML-javascript seems to be larger than 32 bit, and
+       can be used to store q(u)int64 types.
+
+       QML 'quint64' and 'qint64' can be used, but be aware these will in some cases be downcast
+       by QML to 'int' (e.g. when using the property in a property binding, _even_ when a binding
+       is done between two q(u)int64 properties (at least up until Qt6.4))
+    """
+
     _logger = get_logger(__name__)
 
     def __init__(self, *, amount_sat: int = 0, amount_msat: int = 0, is_max: bool = False, from_invoice=None, parent=None):
@@ -85,6 +90,7 @@ class QEAmount(QObject):
         self._is_max = False
         self.valueChanged.emit()
 
+    @pyqtSlot('QVariant')
     def copyFrom(self, amount):
         if not amount:
             self._logger.warning('copyFrom with None argument. assuming 0')  # TODO
@@ -111,3 +117,27 @@ class QEAmount(QObject):
 
     def __repr__(self):
         return f"<QEAmount max={self._is_max} sats={self._amount_sat} msats={self._amount_msat} empty={self.isEmpty}>"
+
+
+class QEBytes(QObject):
+    def __init__(self, data: bytes = None, *, parent=None):
+        super().__init__(parent)
+        self.data = data
+
+    @property
+    def data(self):
+        return self._data
+
+    @data.setter
+    def data(self, _data):
+        self._data = _data
+
+    @pyqtProperty(bool)
+    def isEmpty(self):
+        return self._data is None or self._data == bytes()
+
+    def __str__(self):
+        return f'{self._data}'
+
+    def __repr__(self):
+        return f"<QEBytes data={'None' if self._data is None else self._data.hex()}>"

@@ -1,13 +1,15 @@
 import io
+import os
 
 from electrum.lnmsg import (read_bigsize_int, write_bigsize_int, FieldEncodingNotMinimal,
                             UnexpectedEndOfStream, LNSerializer, UnknownMandatoryTLVRecordType,
                             MalformedMsg, MsgTrailingGarbage, MsgInvalidFieldOrder, encode_msg,
                             decode_msg, UnexpectedFieldSizeForEncoder, OnionWireSerializer,
-                            UnknownMsgType)
+                            UnknownMsgType, _tlv_merkle_root, _read_tlv_record)
 from electrum.lnonion import OnionRoutingFailure
-from electrum.util import bfh
+from electrum.util import bfh, read_json_file
 from electrum.lnutil import ShortChannelID, LnFeatures
+from electrum.channel_db import NodeInfo
 from electrum import constants
 
 from . import ElectrumTestCase
@@ -115,9 +117,8 @@ class TestLNMsg(ElectrumTestCase):
             lnser.read_tlv_stream(fd=io.BytesIO(bfh("0329023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb0000000000000001")), tlv_stream_name="n1")
         with self.assertRaises(UnexpectedEndOfStream):
             lnser.read_tlv_stream(fd=io.BytesIO(bfh("0330023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb000000000000000100000000000001")), tlv_stream_name="n1")
-        # check if ECC point is valid?... skip for now.
-        #with self.assertRaises(Exception):
-        #    lnser.read_tlv_stream(fd=io.BytesIO(bfh("0331043da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb00000000000000010000000000000002")), tlv_stream_name="n1")
+        with self.assertRaises(MalformedMsg):  # check if ECC point is valid
+           lnser.read_tlv_stream(fd=io.BytesIO(bfh("0331043da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb00000000000000010000000000000002")), tlv_stream_name="n1")
         with self.assertRaises(MsgTrailingGarbage):
             lnser.read_tlv_stream(fd=io.BytesIO(bfh("0332023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb0000000000000001000000000000000001")), tlv_stream_name="n1")
         with self.assertRaises(UnexpectedEndOfStream):
@@ -370,3 +371,68 @@ class TestLNMsg(ElectrumTestCase):
             OnionWireSerializer.decode_msg(orf2.to_bytes())
         self.assertEqual(None, orf2.decode_data())
 
+    def test_address_parsing_and_serialization(self):
+        """Tests the NodeInfo bolt7 node_announcement addresses field serialization and parsing"""
+        taf = NodeInfo.to_addresses_field
+        paf = NodeInfo.parse_addresses_field
+
+        # -- INVALID INPUTS --
+        invalid_inputs_parsing = (
+            b'', # empty input
+            b'\x06\x00', # address type 6 (\x06) is not specified
+        )
+        invalid_inputs_serialization = (
+            ("::1", 9735),  # local ipv6
+            ("::", 9735),  # local ipv6
+            ("::1", 0),  # local host, invalid port
+            ("::1", 65536),  # local host, invalid port
+            ("127.0.0.1", 9735),  # local ipv4
+            ("localhost", 9735),  # local host
+            ("domain.com", 0),  # domain, invalid port
+            ("domain.com", 65536),  # domain, invalid port
+            ("domain.com", -1),  # domain, invalid port
+            ("expyuzz4wqqyqhjn.onion", 9735),  # onion v2, not supported
+            ("", 9735),  # empty address
+        )
+        for invalid_input in invalid_inputs_parsing:
+            self.assertEqual(paf(invalid_input), [])
+        for host, port in invalid_inputs_serialization:
+            self.assertEqual(taf(host, port), b'')
+
+        # -- VALID INPUTS --
+        valid_inputs = (
+            ("34.138.100.228", 9735),  # ipv4
+            ("2001:41d0:0001:b40d:0000:0000:0000:0001", 9735),  # ipv6
+            ("2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion", 9735), # onion v3
+            ("ecb.europa.eu", 8624),  # domain
+        )
+        valid_inputs_with_defined_output = [
+            [["2001:41d0:1:b40d::1", 9735], [("2001:41d0:0001:b40d:0000:0000:0000:0001", 9735)]]  # ipv6
+        ]
+        for host, port in valid_inputs:
+            self.assertEqual(paf(taf(host, port)), [(host, port)])
+        for input_, output in valid_inputs_with_defined_output:
+            self.assertEqual(paf(taf(*input_)), output)
+
+    def test_bolt12_merkle_root_test_vectors(self):
+        """Tests against the test vector file from the bolts repository."""
+        test_vector_file = os.path.join(os.path.dirname(__file__), "bolt12-signature-test.json")
+        vectors = read_json_file(test_vector_file)
+        leaf_key_prefix = "H(`LnLeaf`,"
+
+        def _extract_tlvs(vector):
+            tlvs = []
+            for leaf in vector["leaves"]:
+                leaf_tlv_hex = next(  # "H(`LnLeaf`,010203e8)" <- extract the tlv hex
+                    k[len(leaf_key_prefix):-1] for k in leaf if k.startswith(leaf_key_prefix)
+                )
+                tlv_bytes = bfh(leaf_tlv_hex)
+                tlv_type, _, _ = _read_tlv_record(fd=io.BytesIO(tlv_bytes))
+                tlvs.append((tlv_type, tlv_bytes))
+            return tlvs
+
+        for vector in vectors:
+            with self.subTest(comment=vector["comment"]):
+                tlvs = _extract_tlvs(vector)
+                merkle_root = _tlv_merkle_root(tlvs)
+                self.assertEqual(vector["merkle"], merkle_root.hex())

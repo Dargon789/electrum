@@ -1,11 +1,11 @@
 #!/bin/bash
 
-LIBUSB_VERSION="4239bc3a50014b8e6a5a2a59df1fff3b7469543b"
-# ^ tag v1.0.26
+LIBUSB_VERSION="d52e355daa09f17ce64819122cb067b8a2ee0d4b"
+# ^ tag v1.0.27
 
 set -e
 
-. $(dirname "$0")/build_tools_util.sh || (echo "Could not source build_tools_util.sh" && exit 1)
+. "$(dirname "$0")/build_tools_util.sh" || (echo "Could not source build_tools_util.sh" && exit 1)
 
 here="$(dirname "$(realpath "$0" 2> /dev/null || grealpath "$0")")"
 CONTRIB="$here"

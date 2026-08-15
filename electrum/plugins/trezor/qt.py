@@ -12,10 +12,11 @@ from electrum.i18n import _
 from electrum.logging import Logger
 from electrum.plugin import hook
 from electrum.keystore import ScriptTypeNotSupported
+from electrum.util import ChoiceItem
 
-from electrum.plugins.hw_wallet.qt import QtHandlerBase, QtPluginBase
-from electrum.plugins.hw_wallet.trezor_qt_pinmatrix import PinMatrixWidget
-from electrum.plugins.hw_wallet.plugin import only_hook_if_libraries_available, OutdatedHwFirmwareException
+from electrum.hw_wallet.qt import QtHandlerBase, QtPluginBase
+from electrum.hw_wallet.trezor_qt_pinmatrix import PinMatrixWidget
+from electrum.hw_wallet.plugin import only_hook_if_libraries_available, OutdatedHwFirmwareException
 
 from electrum.gui.qt.util import (WindowModalDialog, WWLabel, Buttons, CancelButton,
                                   OkButton, CloseButton, PasswordLineEdit, getOpenFileName, ChoiceWidget)
@@ -247,12 +248,12 @@ class QtPlugin(QtPluginBase):
     def receive_menu(self, menu, addrs, wallet):
         if len(addrs) != 1:
             return
-        for keystore in wallet.get_keystores():
-            if type(keystore) == self.keystore_class:
-                def show_address(keystore=keystore):
-                    keystore.thread.add(partial(self.show_address, wallet, addrs[0], keystore))
-                device_name = "{} ({})".format(self.device, keystore.label)
-                menu.addAction(_("Show on {}").format(device_name), show_address)
+        self._add_menu_action(menu, addrs[0], wallet)
+
+    @only_hook_if_libraries_available
+    @hook
+    def transaction_dialog_address_menu(self, menu, addr, wallet):
+        self._add_menu_action(menu, addr, wallet)
 
     def show_settings_dialog(self, window, keystore):
         def connect():
@@ -465,10 +466,6 @@ class Plugin(TrezorPlugin, QtPlugin):
     def pin_matrix_widget_class(self):
         return PinMatrixWidget
 
-    @hook
-    def init_wallet_wizard(self, wizard: 'QENewWalletWizard'):
-        self.extend_wizard(wizard)
-
     # insert trezor pages in new wallet wizard
     def extend_wizard(self, wizard: 'QENewWalletWizard'):
         super().extend_wizard(wizard)
@@ -479,6 +476,7 @@ class Plugin(TrezorPlugin, QtPlugin):
             'trezor_choose_new_recover': {'gui': WCTrezorInitParams},
             'trezor_do_init': {'gui': WCTrezorInit},
             'trezor_unlock': {'gui': WCHWUnlock},
+            'trezor_unpaired': {'gui': WCTrezorPair},
         }
         wizard.navmap_merge(views)
 
@@ -847,8 +845,8 @@ class WCTrezorInitMethod(WalletWizardComponent, Logger):
         message = _('Choose how you want to initialize your {}.').format(_info.model_name)
         choices = [
             # Must be short as QT doesn't word-wrap radio button text
-            (TIM_NEW, _("Let the device generate a completely new seed randomly")),
-            (TIM_RECOVER, _("Recover from a seed you have previously written down")),
+            ChoiceItem(key=TIM_NEW, label=_("Let the device generate a completely new seed randomly")),
+            ChoiceItem(key=TIM_RECOVER, label=_("Recover from a seed you have previously written down")),
         ]
         self.choice_w = ChoiceWidget(message=message, choices=choices)
         self.layout().addWidget(self.choice_w)
@@ -912,7 +910,7 @@ class WCTrezorInit(WalletWizardComponent, Logger):
                 self.wizard.requestNext.emit()  # triggers Next GUI thread from event loop
             except Exception as e:
                 self.valid = False
-                self.error = repr(e)
+                self.error = str(e)
                 self.logger.exception(repr(e))
             finally:
                 self.busy = False
@@ -922,6 +920,48 @@ class WCTrezorInit(WalletWizardComponent, Logger):
             args=(settings, method, device_id, client.handler),
             daemon=True)
         t.start()
+
+    def apply(self):
+        pass
+
+
+class WCTrezorPair(WalletWizardComponent, Logger):
+    def __init__(self, parent, wizard):
+        WalletWizardComponent.__init__(self, parent, wizard, title=_('Trezor Pairing'))
+        Logger.__init__(self)
+        self.plugins = wizard.plugins
+        self._busy = True
+
+    def on_ready(self):
+        current_cosigner = self.wizard.current_cosigner(self.wizard_data)
+        _name, _info = current_cosigner['hardware_device']
+        self.plugin = self.plugins.get_plugin(_info.plugin_name)
+
+        device_id = _info.device.id_
+        client = self.plugins.device_manager.client_by_id(device_id, scan_now=False)
+        if client is None:
+            self.error = _("Client for hardware device was unpaired.")
+            self.busy = False
+            return
+
+        client.handler = self.plugin.create_handler(self.wizard)
+
+        def pair_task(client):
+            try:
+                with client.run_flow(f"Confirm pairing with {client.device_model_name()}"):
+                    client.pair_if_needed()
+
+                self.wizard_data['trezor_initialized'] = client.features.initialized
+                self.wizard.requestNext.emit()  # triggers Next GUI thread from event loop
+            except Exception as e:
+                self.error = str(e)  # TODO: handle user interaction exceptions (e.g. invalid pin) more gracefully
+                self.logger.exception(repr(e))
+            finally:
+                self.busy = False
+
+        t = threading.Thread(target=pair_task, args=(client,), daemon=True)
+        t.start()
+
 
     def apply(self):
         pass

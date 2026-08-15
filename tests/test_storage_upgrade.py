@@ -14,11 +14,10 @@ from electrum import util
 from electrum.plugin import Plugins
 from electrum.simple_config import SimpleConfig
 
-from . import as_testnet
+from . import as_testnet, as_regtest
 from .test_wallet import WalletTestCase
 
 
-WALLET_FILES_DIR = os.path.join(os.path.dirname(__file__), "test_storage_upgrade")
 
 
 # TODO add other wallet types: 2fa, xpub-only
@@ -30,7 +29,7 @@ class TestStorageUpgrade(WalletTestCase):
         assert isinstance(test_method_name, str)
         assert test_method_name.startswith("test_upgrade_from_")
         fname = test_method_name[len("test_upgrade_from_"):]
-        test_vector_file = os.path.join(WALLET_FILES_DIR, fname)
+        test_vector_file = self.get_wallet_file_path(fname)
         with open(test_vector_file, "r") as f:
             wallet_str = f.read()
         return wallet_str
@@ -313,11 +312,22 @@ class TestStorageUpgrade(WalletTestCase):
         wallet_str = self._get_wallet_str()
         await self._upgrade_storage(wallet_str)
 
+    async def test_upgrade_from_client_4_0_1_with_invoices(self):
+        # wallet with one invoice and one request. seed_version is 31
+        wallet_str = self._get_wallet_str()
+        await self._upgrade_storage(wallet_str)
+
     @as_testnet
     async def test_upgrade_from_client_4_5_2_9dk_with_ln(self):
         # This is a realistic testnet wallet, from the "9dk" seed, including some lightning sends/receives,
         # some labels, frozen addresses, saved local txs, invoices/requests, etc. The file also has partial writes.
         # Also, regression test for #8913
+        wallet_str = self._get_wallet_str()
+        await self._upgrade_storage(wallet_str)
+
+    @as_regtest
+    async def test_upgrade_from_client_4_6_0_with_unfulfilled_htlcs(self):
+        # tests unfulfilled_htlcs conversion in 62->63. seed_version is 60.
         wallet_str = self._get_wallet_str()
         await self._upgrade_storage(wallet_str)
 

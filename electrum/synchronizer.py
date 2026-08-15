@@ -24,7 +24,7 @@
 # SOFTWARE.
 import asyncio
 import hashlib
-from typing import Dict, List, TYPE_CHECKING, Tuple, Set
+from typing import Dict, List, TYPE_CHECKING, Tuple, Set, Optional, Sequence
 from collections import defaultdict
 import logging
 
@@ -33,9 +33,9 @@ from aiorpcx import run_in_thread, RPCError
 from . import util
 from .transaction import Transaction, PartialTransaction
 from .util import make_aiohttp_session, NetworkJobOnDefaultServer, random_shuffled_copy, OldTaskGroup
-from .bitcoin import address_to_scripthash, is_address
+from .bitcoin import address_to_scripthash, is_address, neuter_bitcoin_address
 from .logging import Logger
-from .interface import GracefulDisconnect, NetworkTimeout
+from .interface import GracefulDisconnect, NetworkTimeout, assert_hash256_str
 
 if TYPE_CHECKING:
     from .network import Network
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 class SynchronizerFailure(Exception): pass
 
 
-def history_status(h):
+def history_status(h: Sequence[tuple[str, int]]) -> Optional[str]:
     if not h:
         return None
     status = ''
@@ -83,20 +83,20 @@ class SynchronizerBase(NetworkJobOnDefaultServer):
             # we are being cancelled now
             self.session.unsubscribe(self.status_queue)
 
-    def add(self, addr):
-        if not is_address(addr): raise ValueError(f"invalid bitcoin address {addr}")
+    def add(self, addr: str) -> None:
+        if not is_address(addr): raise ValueError(f"invalid bitcoin address {neuter_bitcoin_address(addr)}")
         self._adding_addrs.add(addr)  # this lets is_up_to_date already know about addr
 
     async def _add_address(self, addr: str):
         try:
-            if not is_address(addr): raise ValueError(f"invalid bitcoin address {addr}")
+            if not is_address(addr): raise ValueError(f"invalid bitcoin address {neuter_bitcoin_address(addr)}")
             if addr in self.requested_addrs: return
             self.requested_addrs.add(addr)
             await self.taskgroup.spawn(self._subscribe_to_address, addr)
         finally:
             self._adding_addrs.discard(addr)  # ok for addr not to be present
 
-    async def _on_address_status(self, addr, status):
+    async def _on_address_status(self, addr: str, status: Optional[str]):
         """Handle the change of the status of an address.
         Should remove addr from self._handling_addr_statuses when done.
         """
@@ -117,8 +117,13 @@ class SynchronizerBase(NetworkJobOnDefaultServer):
 
     async def handle_status(self):
         while True:
-            h, status = await self.status_queue.get()
-            addr = self.scripthash_to_address[h]
+            sh, status = await self.status_queue.get()
+            # basic checks for response
+            assert_hash256_str(sh)
+            if status is not None:
+                assert_hash256_str(status)
+            # process status
+            addr = self.scripthash_to_address[sh]
             self._handling_addr_statuses.add(addr)
             self.requested_addrs.discard(addr)  # ok for addr not to be present
             await self.taskgroup.spawn(self._on_address_status, addr, status)
@@ -143,7 +148,7 @@ class Synchronizer(SynchronizerBase):
     def _reset(self):
         super()._reset()
         self._init_done = False
-        self.requested_tx = {}
+        self.requested_tx = set()  # type: Set[str]
         self.requested_histories = set()
         self._stale_histories = dict()  # type: Dict[str, asyncio.Task]
 
@@ -160,10 +165,30 @@ class Synchronizer(SynchronizerBase):
                 and not self._stale_histories
                 and self.status_queue.empty())
 
+    async def _maybe_request_history_for_addr(self, addr: str, *, ann_status: Optional[str]) -> List[dict]:
+        # First opportunistically try to guess the addr history. Might save us network requests.
+        old_history = self.adb.db.get_addr_history(addr)
+        def guess_height(old_height: int) -> int:
+            if old_height in (0, -1,):
+                return self.interface.tip  # maybe mempool tx got mined just now
+            return old_height
+        guessed_history = [(txid, guess_height(old_height)) for (txid, old_height) in old_history]
+        if history_status(guessed_history) == ann_status:
+            self.logger.debug(f"managed to guess new history for {addr}. won't call 'blockchain.scripthash.get_history'.")
+            return [{"height": height, "tx_hash": txid} for (txid, height) in guessed_history]
+        # request addr history from server
+        sh = address_to_scripthash(addr)
+        self._requests_sent += 1
+        async with self._network_request_semaphore:
+            result = await self.interface.get_history_for_scripthash(sh)
+        self._requests_answered += 1
+        self.logger.info(f"receiving history {addr} {len(result)}")
+        return result
+
     async def _on_address_status(self, addr, status):
         try:
-            history = self.adb.db.get_addr_history(addr)
-            if history_status(history) == status:
+            old_history = self.adb.db.get_addr_history(addr)
+            if history_status(old_history) == status:
                 return
             # No point in requesting history twice for the same announced status.
             # However if we got announced a new status, we should request history again:
@@ -174,12 +199,7 @@ class Synchronizer(SynchronizerBase):
             self._stale_histories.pop(addr, asyncio.Future()).cancel()
         finally:
             self._handling_addr_statuses.discard(addr)
-        h = address_to_scripthash(addr)
-        self._requests_sent += 1
-        async with self._network_request_semaphore:
-            result = await self.interface.get_history_for_scripthash(h)
-        self._requests_answered += 1
-        self.logger.info(f"receiving history {addr} {len(result)}")
+        result = await self._maybe_request_history_for_addr(addr, ann_status=status)
         hist = list(map(lambda item: (item['tx_hash'], item['height']), result))
         # tx_fees
         tx_fees = [(item['tx_hash'], item.get('fee')) for item in result]
@@ -208,14 +228,15 @@ class Synchronizer(SynchronizerBase):
     async def _request_missing_txs(self, hist, *, allow_server_not_finding_tx=False):
         # "hist" is a list of [tx_hash, tx_height] lists
         transaction_hashes = []
-        for tx_hash, tx_height in hist:
+        for tx_hash, _tx_height in hist:
             if tx_hash in self.requested_tx:
                 continue
             tx = self.adb.db.get_transaction(tx_hash)
             if tx and not isinstance(tx, PartialTransaction):
                 continue  # already have complete tx
             transaction_hashes.append(tx_hash)
-            self.requested_tx[tx_hash] = tx_height
+            # note: tx_height might change by the time we get the raw_tx
+            self.requested_tx.add(tx_hash)
 
         if not transaction_hashes: return
         async with OldTaskGroup() as group:
@@ -230,7 +251,7 @@ class Synchronizer(SynchronizerBase):
         except RPCError as e:
             # most likely, "No such mempool or blockchain transaction"
             if allow_server_not_finding_tx:
-                self.requested_tx.pop(tx_hash)
+                self.requested_tx.remove(tx_hash)
                 return
             else:
                 raise
@@ -239,9 +260,9 @@ class Synchronizer(SynchronizerBase):
         tx = Transaction(raw_tx)
         if tx_hash != tx.txid():
             raise SynchronizerFailure(f"received tx does not match expected txid ({tx_hash} != {tx.txid()})")
-        tx_height = self.requested_tx.pop(tx_hash)
-        self.adb.receive_tx_callback(tx, tx_height)
-        self.logger.info(f"received tx {tx_hash} height: {tx_height} bytes: {len(raw_tx)}")
+        self.requested_tx.remove(tx_hash)
+        self.adb.receive_tx_callback(tx)
+        self.logger.info(f"received tx {tx_hash}. bytes-len: {len(raw_tx)//2}")
 
     async def main(self):
         self.adb.up_to_date_changed()

@@ -27,7 +27,7 @@ import os
 import sys
 
 
-MIN_PYTHON_VERSION = "3.8.0"  # FIXME duplicated from setup.py
+MIN_PYTHON_VERSION = "3.10.0"  # FIXME duplicated from setup.py
 _min_python_version_tuple = tuple(map(int, (MIN_PYTHON_VERSION.split("."))))
 
 
@@ -37,7 +37,7 @@ if sys.version_info[:3] < _min_python_version_tuple:
 
 import warnings
 import asyncio
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Dict
 
 
 script_dir = os.path.dirname(os.path.realpath(__file__))
@@ -65,23 +65,27 @@ if is_pyinstaller:
     _file = open(sys.executable, 'rb')
 
 
+# when running from source, on Windows, also search for DLLs in inner 'electrum' folder
+if is_local and os.name == 'nt':  # fixme: duplicated between main script and __init__.py :(
+    os.add_dll_directory(os.path.join(os.path.dirname(__file__), 'electrum'))
+
+
 def check_imports():
     # pure-python dependencies need to be imported here for pyinstaller
     try:
         import dns
         import certifi
         import qrcode
-        import google.protobuf
         import aiorpcx
+        import aiohttp
+        import aiohttp_socks
+        import electrum_ecc
+        import jsonpatch
+        import electrum_aionostr
     except ImportError as e:
-        sys.exit(f"Error: {str(e)}. Try 'sudo python3 -m pip install <module-name>'")
-    if not ((0, 22, 0) <= aiorpcx._version < (0, 24)):
-        raise RuntimeError(f'aiorpcX version {aiorpcx._version} does not match required: 0.22.0<=ver<0.24')
-    # the following imports are for pyinstaller
-    from google.protobuf import descriptor
-    from google.protobuf import message
-    from google.protobuf import reflection
-    from google.protobuf import descriptor_pb2
+        sys.exit(f"Error: {str(e)}. Some dependencies are missing. Have you read the README? Or just try '$ python3 -m pip install -r contrib/requirements/requirements.txt'")
+    if not ((0, 25, 0) <= aiorpcx._version < (0, 26)):
+        raise RuntimeError(f'aiorpcX version {aiorpcx._version} does not match required: 0.25.0<=ver<0.26')
     # make sure that certificates are here
     assert os.path.exists(certifi.where())
 
@@ -90,28 +94,42 @@ if not is_android:
     check_imports()
 
 
+if is_android:
+    # hack to make pycryptodomex work on Android
+    # from https://github.com/kivy/python-for-android/issues/1866#issuecomment-927157780
+    import ctypes
+    ctypes.pythonapi = ctypes.PyDLL("libpython%d.%d.so" % sys.version_info[:2])  # replaces ctypes.PyDLL(None)
+
+
+# Set default application-wide file umask to more restrictive than typical.
+# We want to create all files and directories (esp. inside the datadir) with locked-down permissions.
+# note: this helps even on Windows! (see https://docs.python.org/3/library/os.html#os.mkdir)
+#       > `os.mkdir(path, mode=0o777, *, dir_fd=None)`
+#       >   On Windows, a mode of 0o700 is specifically handled to apply access control to the new
+#       >   directory such that only the current user and administrators have access.
+os.umask(0o0077)
+
+
 sys._ELECTRUM_RUNNING_VIA_RUNELECTRUM = True  # used by logging.py
 
 from electrum.logging import get_logger, configure_logging  # import logging submodule first
 from electrum import util
 from electrum.payment_identifier import PaymentIdentifier
-from electrum import constants
 from electrum import SimpleConfig
 from electrum.wallet_db import WalletDB
 from electrum.wallet import Wallet
 from electrum.storage import WalletStorage
 from electrum.util import print_msg, print_stderr, json_encode, json_decode, UserCancelled
 from electrum.util import InvalidPassword
-from electrum.commands import get_parser, known_commands, Commands, config_variables
+from electrum.plugin import Plugins
+from electrum.commands import get_parser, get_simple_parser, known_commands, Commands, config_variables
 from electrum import daemon
-from electrum import keystore
 from electrum.util import create_and_start_event_loop, UserFacingException, JsonRPCError
 from electrum.i18n import set_language
+from electrum import constants
 
 if TYPE_CHECKING:
     import threading
-
-    from electrum.plugin import Plugins
 
 _logger = get_logger(__name__)
 
@@ -139,8 +157,12 @@ def init_cmdline(config_options, wallet_path, *, rpcserver: bool, config: 'Simpl
     if cmdname in ['payto', 'paytomany'] and config.get('broadcast'):
         cmd.requires_network = True
 
+    if cmd.requires_wallet and not wallet_path:
+        print_msg("wallet path not provided.")
+        sys_exit(1)
+
     # instantiate wallet for command-line
-    storage = WalletStorage(wallet_path)
+    storage = WalletStorage(wallet_path, allow_partial_writes=config.WALLET_PARTIAL_WRITES) if wallet_path else None
 
     if cmd.requires_wallet and not storage.file_exists():
         print_msg("Error: Wallet file not found.")
@@ -200,8 +222,7 @@ def get_connected_hw_devices(plugins: 'Plugins'):
 def get_password_for_hw_device_encrypted_storage(plugins: 'Plugins') -> str:
     devices = get_connected_hw_devices(plugins)
     if len(devices) == 0:
-        print_msg("Error: No connected hw device found. Cannot decrypt this wallet.")
-        sys.exit(1)
+        raise UserFacingException("Error: No connected hw device found. Cannot decrypt this wallet.")
     elif len(devices) > 1:
         print_msg("Warning: multiple hardware devices detected. "
                   "The first one will be used to decrypt the wallet.")
@@ -213,17 +234,17 @@ def get_password_for_hw_device_encrypted_storage(plugins: 'Plugins') -> str:
         client.handler = client.plugin.create_handler(None)
         return client.get_password_for_storage_encryption()
     except UserCancelled:
-        sys.exit(0)
+        raise
 
 
-async def run_offline_command(config, config_options, plugins: 'Plugins'):
+async def run_offline_command(config: 'SimpleConfig', config_options: dict, wallet_path: str, plugins: 'Plugins'):
     cmdname = config.get('cmd')
     cmd = known_commands[cmdname]
     password = config_options.get('password')
     if 'wallet_path' in cmd.options and config_options.get('wallet_path') is None:
-        config_options['wallet_path'] = config.get_wallet_path()
+        config_options['wallet_path'] = wallet_path
     if cmd.requires_wallet:
-        storage = WalletStorage(config.get_wallet_path())
+        storage = WalletStorage(wallet_path, allow_partial_writes=config.WALLET_PARTIAL_WRITES)
         if storage.is_encrypted():
             if storage.is_encrypted_with_hw_device():
                 password = get_password_for_hw_device_encrypted_storage(plugins)
@@ -240,7 +261,7 @@ async def run_offline_command(config, config_options, plugins: 'Plugins'):
             wallet.check_password(password)
         except InvalidPassword:
             print_msg("Error: This password does not decode this wallet.")
-            sys.exit(1)
+            raise
     if cmd.requires_network:
         print_msg("Warning: running command offline")
     # arguments passed to function
@@ -261,14 +282,10 @@ async def run_offline_command(config, config_options, plugins: 'Plugins'):
     return result
 
 
-def init_plugins(config, gui_name):
-    from electrum.plugin import Plugins
-    return Plugins(config, gui_name)
-
-
 loop = None  # type: Optional[asyncio.AbstractEventLoop]
 stop_loop = None  # type: Optional[asyncio.Future]
 loop_thread = None  # type: Optional[threading.Thread]
+
 
 def sys_exit(i):
     # stop event loop and exit
@@ -276,6 +293,69 @@ def sys_exit(i):
         loop.call_soon_threadsafe(stop_loop.set_result, 1)
         loop_thread.join(timeout=1)
     sys.exit(i)
+
+
+def read_config(config_options: dict) -> SimpleConfig:
+    """
+    Reads the config file and returns SimpleConfig, on failure it will potentially
+    show a GUI error dialog if a gui is available, and then re-raise the exception.
+    """
+    try:
+        return SimpleConfig(config_options)
+    except Exception as config_error:
+        # parse full cmd to find out which UI is being used
+        full_config_options = parse_command_line(simple_parser=False)
+        if full_config_options.get("cmd") == 'gui':
+            gui_name = full_config_options.get(SimpleConfig.GUI_NAME.key(), 'qt')
+            try:
+                gui = __import__(f'electrum.gui.{gui_name}', fromlist=['electrum'])
+                gui.standalone_exception_dialog(config_error)  # type: ignore
+            except Exception as e:
+                print_stderr(f"Error showing standalone gui dialog: {e}")
+        raise
+
+
+def parse_command_line(simple_parser=False) -> Dict:
+    # parse command line from sys.argv
+    if simple_parser:
+        parser = get_simple_parser()
+        options, args = parser.parse_args()
+        config_options = options.__dict__
+        config_options['cmd'] = 'gui'
+    else:
+        parser = get_parser()
+        args = parser.parse_args()
+        config_options = args.__dict__
+        f = lambda key: config_options[key] is not None and key not in config_variables.get(args.cmd, {}).keys()
+        config_options = {key: config_options[key] for key in filter(f, config_options.keys())}
+        if config_options.get(SimpleConfig.NETWORK_SERVER.key()):
+            config_options[SimpleConfig.NETWORK_AUTO_CONNECT.key()] = False
+        if config_options.get(SimpleConfig.NETWORK_PROXY.key()):
+            config_options[SimpleConfig.NETWORK_PROXY_ENABLED.key()] = True
+
+    config_options['cwd'] = cwd = os.getcwd()
+
+    # fixme: this can probably be achieved with a runtime hook (pyinstaller)
+    if is_pyinstaller and os.path.exists(os.path.join(sys._MEIPASS, 'is_portable')):
+        config_options['portable'] = True
+
+    if config_options.get('portable'):
+        if is_local:
+            # running from git clone or local source: put datadir next to main script
+            datadir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'electrum_data')
+        else:
+            # Running a binary or installed source. The most generic but still reasonable thing
+            # is to use the current working directory. (see #7732)
+            # note: The main script is often unpacked to a temporary directory from a bundled executable,
+            #       and we don't want to put the datadir inside a temp dir.
+            # note: Re the portable .exe on Windows, when the user double-clicks it, CWD gets set
+            #       to the parent dir, i.e. we will put the datadir next to the exe.
+            datadir = os.path.join(os.path.realpath(cwd), 'electrum_data')
+        config_options['electrum_path'] = datadir
+
+    if not config_options.get('verbosity'):
+        warnings.simplefilter('ignore', DeprecationWarning)
+    return config_options
 
 
 def main():
@@ -314,10 +394,6 @@ def main():
         elif arg == ':':
             sys.argv[i] = prompt_password('Enter argument (will not echo):', confirm=False)
 
-    # parse command line
-    parser = get_parser()
-    args = parser.parse_args()
-
     # config is an object passed to the various constructors (wallet, interface, gui)
     if is_android:
         import importlib.util
@@ -325,43 +401,27 @@ def main():
             'verbosity': '*' if util.is_android_debug_apk() else '',
             'cmd': 'gui',
             SimpleConfig.GUI_NAME.key(): 'qml',
-            SimpleConfig.WALLET_USE_SINGLE_PASSWORD.key(): True,
-            SimpleConfig.SWAPSERVER_URL: 'https://swaps.electrum.org/api',
+            SimpleConfig.WALLET_SHOULD_USE_SINGLE_PASSWORD.key(): True,
+            SimpleConfig.DISABLE_MEMORY_HARDENING_LINUX.key(): True,
         }
-        if util.get_android_package_name() == "org.electrum.testnet.electrum":
-            # ~hack for easier testnet builds. pkgname subject to change.
-            config_options['testnet'] = True
+        SimpleConfig.set_chain_config_opt_based_on_android_packagename(config_options)
     else:
-        config_options = args.__dict__
-        f = lambda key: config_options[key] is not None and key not in config_variables.get(args.cmd, {}).keys()
-        config_options = {key: config_options[key] for key in filter(f, config_options.keys())}
-        if config_options.get(SimpleConfig.NETWORK_SERVER.key()):
-            config_options[SimpleConfig.NETWORK_AUTO_CONNECT.key()] = False
+        # save sys args for next parser
+        saved_sys_argv = sys.argv[:]
+        # disable help, the next parser will display it
+        for x in sys.argv:
+            if x in ['-h', '--help']:
+                sys.argv.remove(x)
+        # parse first without plugins
+        config_options = parse_command_line(simple_parser=True)
+        tmp_config = read_config(config_options)
+        # load (only) the commands modules of plugins so their commands are registered
+        _plugin_commands = Plugins(tmp_config, cmd_only=True)
+        # re-parse command line
+        sys.argv = saved_sys_argv[:]
+        config_options = parse_command_line()
 
-    config_options['cwd'] = cwd = os.getcwd()
-
-    # fixme: this can probably be achieved with a runtime hook (pyinstaller)
-    if is_pyinstaller and os.path.exists(os.path.join(sys._MEIPASS, 'is_portable')):
-        config_options['portable'] = True
-
-    if config_options.get('portable'):
-        if is_local:
-            # running from git clone or local source: put datadir next to main script
-            datadir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'electrum_data')
-        else:
-            # Running a binary or installed source. The most generic but still reasonable thing
-            # is to use the current working directory. (see #7732)
-            # note: The main script is often unpacked to a temporary directory from a bundled executable,
-            #       and we don't want to put the datadir inside a temp dir.
-            # note: Re the portable .exe on Windows, when the user double-clicks it, CWD gets set
-            #       to the parent dir, i.e. we will put the datadir next to the exe.
-            datadir = os.path.join(os.path.realpath(cwd), 'electrum_data')
-        config_options['electrum_path'] = datadir
-
-    if not config_options.get('verbosity'):
-        warnings.simplefilter('ignore', DeprecationWarning)
-
-    config = SimpleConfig(config_options)
+    config = read_config(config_options)
     cmdname = config.get('cmd')
 
     # set language as early as possible
@@ -384,22 +444,18 @@ def main():
                 _logger.info(f"get_default_language: failed. got exc={e!r}")
         set_language(lang)
 
-    if config.get('testnet'):
-        constants.BitcoinTestnet.set_as_network()
-    elif config.get('testnet4'):
-        constants.BitcoinTestnet4.set_as_network()
-    elif config.get('regtest'):
-        constants.BitcoinRegtest.set_as_network()
-    elif config.get('simnet'):
-        constants.BitcoinSimnet.set_as_network()
-    elif config.get('signet'):
-        constants.BitcoinSignet.set_as_network()
+    chain = config.get_selected_chain()
+    chain.set_as_network()
 
     # check if we received a valid payment identifier
     uri = config_options.get('url')
     if uri and not PaymentIdentifier(None, uri).is_valid():
         print_stderr('unknown command:', uri)
         sys.exit(1)
+
+    if sys.platform == "linux" and not config.DISABLE_MEMORY_HARDENING_LINUX:
+        import electrum.harden_memory_linux
+        electrum.harden_memory_linux.set_dumpable_safe(False)
 
     if cmdname == 'daemon' and config.get("detach"):
         # detect lockfile.
@@ -458,7 +514,9 @@ def handle_cmd(*, cmdname: str, config: 'SimpleConfig', config_options: dict):
         configure_logging(config)
         fd = daemon.get_file_descriptor(config)
         if fd is not None:
-            d = daemon.Daemon(config, fd, start_network=False)
+            # When running in GUI mode, only start a limited minimal RPC server, to limit attack surface.
+            only_minimal_jsonrpc = not constants.net.TESTNET
+            d = daemon.Daemon(config, fd, start_network=False, only_minimal_jsonrpc=only_minimal_jsonrpc)
             try:
                 d.run_gui()
             except BaseException as e:
@@ -480,12 +538,11 @@ def handle_cmd(*, cmdname: str, config: 'SimpleConfig', config_options: dict):
                 sys_exit(1)
 
     elif cmdname == 'daemon':
-
         configure_logging(config)
         fd = daemon.get_file_descriptor(config)
         if fd is not None:
             # run daemon
-            d = daemon.Daemon(config, fd)
+            d = daemon.Daemon(config, fd, only_minimal_jsonrpc=False)
             d.run_daemon()
             sys_exit(0)
         else:
@@ -497,6 +554,9 @@ def handle_cmd(*, cmdname: str, config: 'SimpleConfig', config_options: dict):
         configure_logging(config, log_to_file=False)  # don't spam logfiles for each client-side RPC, but support "-v"
         cmd = known_commands[cmdname]
         wallet_path = config.get_wallet_path()
+        if cmd.requires_wallet and not wallet_path:
+            print_stderr('wallet path not provided')
+            sys_exit(1)
         if not config.NETWORK_OFFLINE:
             init_cmdline(config_options, wallet_path, rpcserver=True, config=config)
             timeout = config.CLI_TIMEOUT
@@ -524,7 +584,7 @@ def handle_cmd(*, cmdname: str, config: 'SimpleConfig', config_options: dict):
             except Exception as e:
                 _logger.exception("error running command (with daemon)")
                 sys_exit(1)
-        else:
+        else:  # --offline
             if cmd.requires_network:
                 print_msg("This command cannot be run offline")
                 sys_exit(1)
@@ -535,8 +595,8 @@ def handle_cmd(*, cmdname: str, config: 'SimpleConfig', config_options: dict):
                 print_stderr("Run this command without --offline to interact with the daemon")
                 sys_exit(1)
             init_cmdline(config_options, wallet_path, rpcserver=False, config=config)
-            plugins = init_plugins(config, 'cmdline')
-            coro = run_offline_command(config, config_options, plugins)
+            plugins = Plugins(config, 'cmdline')
+            coro = run_offline_command(config, config_options, wallet_path, plugins)
             fut = asyncio.run_coroutine_threadsafe(coro, loop)
             try:
                 try:
@@ -546,6 +606,12 @@ def handle_cmd(*, cmdname: str, config: 'SimpleConfig', config_options: dict):
                     plugins.stopped_event.wait(1)
             except UserFacingException as e:
                 print_stderr(str(e))
+                sys_exit(1)
+            except InvalidPassword:
+                print_stderr("Invalid password")
+                sys_exit(1)
+            except UserCancelled:
+                print_stderr("Aborted by user")
                 sys_exit(1)
             except Exception as e:
                 _logger.exception("error running command (without daemon)")

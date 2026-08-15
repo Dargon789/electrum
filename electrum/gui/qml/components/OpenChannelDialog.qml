@@ -55,6 +55,7 @@ ElDialog {
                             '\n\n',
                             qsTr('If you want to have recoverable channels, you must create a new wallet with an Electrum seed')
                           ].join('')
+                    backgroundColor: constants.darkerDialogBackground
                 }
 
                 InfoTextArea {
@@ -65,78 +66,77 @@ ElDialog {
                     text: [ qsTr('You currently have recoverable channels setting disabled.'),
                             qsTr('This means your channels cannot be recovered from seed.')
                           ].join(' ')
-                }
-
-                Label {
-                    text: qsTr('Node')
-                    Layout.columnSpan: 3
-                    color: Material.accentColor
+                    backgroundColor: constants.darkerDialogBackground
                 }
 
                 // gossip
-                TextArea {
-                    id: node
-                    visible: Config.useGossip
-                    Layout.columnSpan: 2
-                    Layout.fillWidth: true
-                    font.family: FixedFont
-                    wrapMode: Text.Wrap
-                    placeholderText: qsTr('Paste or scan node uri/pubkey')
-                    inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
-                    onTextChanged: {
-                        if (activeFocus)
-                            channelopener.connectStr = text
-                    }
-                    onActiveFocusChanged: {
-                        if (!activeFocus)
-                            channelopener.connectStr = text
-                    }
-                }
-
                 RowLayout {
+                    Layout.columnSpan: 3
                     visible: Config.useGossip
                     spacing: 0
-                    ToolButton {
-                        icon.source: '../../icons/paste.png'
-                        icon.height: constants.iconSizeMedium
-                        icon.width: constants.iconSizeMedium
-                        onClicked: {
-                            var cliptext = AppController.clipboardToText()
-                            if (!cliptext)
-                                return
-                            if (channelopener.validateConnectString(cliptext)) {
-                                channelopener.connectStr = cliptext
-                                node.text = channelopener.connectStr
-                            } else {
-                                var dialog = app.messageDialog.createObject(app, {
-                                    text: qsTr('Invalid node-id or connect string')
+
+                    TextArea {
+                        id: nodeUri
+                        visible: Config.useGossip
+                        Layout.fillWidth: true
+                        Layout.minimumHeight: nodeUriFontMetrics.lineSpacing * 4 + topPadding + bottomPadding
+                        Layout.topMargin: constants.paddingSmall
+                        font.family: FixedFont
+                        wrapMode: Text.Wrap
+                        placeholderText: qsTr('Paste or scan node uri/pubkey')
+                        inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
+                        onTextChanged: {
+                            if (activeFocus)
+                                channelopener.connectStr = text
+                        }
+                        onActiveFocusChanged: {
+                            if (!activeFocus)
+                                channelopener.connectStr = text
+                        }
+                    }
+                    ColumnLayout {
+                        spacing: 0
+                        ToolButton {
+                            icon.source: '../../icons/paste.png'
+                            icon.height: constants.iconSizeMedium
+                            icon.width: constants.iconSizeMedium
+                            onClicked: {
+                                var cliptext = AppController.clipboardToText()
+                                if (!cliptext)
+                                    return
+                                if (channelopener.validateConnectString(cliptext)) {
+                                    channelopener.connectStr = cliptext
+                                    nodeUri.text = channelopener.connectStr
+                                } else {
+                                    var dialog = app.messageDialog.createObject(app, {
+                                        text: qsTr('Invalid node-id or connect string')
+                                    })
+                                    dialog.open()
+                                }
+                            }
+                        }
+                        ToolButton {
+                            icon.source: '../../icons/qrcode.png'
+                            icon.height: constants.iconSizeMedium
+                            icon.width: constants.iconSizeMedium
+                            onClicked: {
+                                var dialog = app.scanDialog.createObject(app, {
+                                    hint: qsTr('Scan a node-id or a connect string')
+                                })
+                                dialog.onFoundText.connect(function(data) {
+                                    if (channelopener.validateConnectString(data)) {
+                                        channelopener.connectStr = data
+                                        nodeUri.text = channelopener.connectStr
+                                    } else {
+                                        var errdialog = app.messageDialog.createObject(app, {
+                                            text: qsTr('Invalid node-id or connect string')
+                                        })
+                                        errdialog.open()
+                                    }
+                                    dialog.close()
                                 })
                                 dialog.open()
                             }
-                        }
-                    }
-                    ToolButton {
-                        icon.source: '../../icons/qrcode.png'
-                        icon.height: constants.iconSizeMedium
-                        icon.width: constants.iconSizeMedium
-                        scale: 1.2
-                        onClicked: {
-                            var dialog = app.scanDialog.createObject(app, {
-                                hint: qsTr('Scan a node-id or a connect string')
-                            })
-                            dialog.onFound.connect(function() {
-                                if (channelopener.validateConnectString(dialog.scanData)) {
-                                    channelopener.connectStr = dialog.scanData
-                                    node.text = channelopener.connectStr
-                                } else {
-                                    var errdialog = app.messageDialog.createObject(app, {
-                                        text: qsTr('Invalid node-id or connect string')
-                                    })
-                                    errdialog.open()
-                                }
-                                dialog.close()
-                            })
-                            dialog.open()
                         }
                     }
                 }
@@ -160,18 +160,28 @@ ElDialog {
                     }
                 }
 
-                Label {
-                    text: qsTr('Amount')
-                    Layout.columnSpan: 3
-                    color: Material.accentColor
-                }
+                Item { Layout.columnSpan: 3; width: 1; height: constants.paddingLarge }
 
                 BtcField {
-                    id: amount
+                    id: amountBtc
                     fiatfield: amountFiat
-                    Layout.preferredWidth: parent.width /3
-                    onTextChanged: channelopener.amount = Config.unitsToSats(amount.text)
-                    enabled: !is_max.checked
+                    Layout.preferredWidth: amountFontMetrics.advanceWidth('0') * 14 + leftPadding + rightPadding
+                    onTextAsSatsChanged: {
+                        if (!is_max.checked)
+                            channelopener.amount = amountBtc.textAsSats
+                    }
+                    readOnly: is_max.checked
+                    color: readOnly
+                        ? Material.accentColor
+                        : Material.foreground
+
+                    Connections {
+                        target: channelopener.amount
+                        function onSatsIntChanged() {
+                            if (is_max.checked)  // amount updated by max amount estimate
+                                amountBtc.text = Config.formatSatsForEditing(channelopener.amount.satsInt)
+                        }
+                    }
                 }
 
                 RowLayout {
@@ -184,7 +194,12 @@ ElDialog {
                         id: is_max
                         text: qsTr('Max')
                         onCheckedChanged: {
-                            channelopener.amount = checked ? MAX : Config.unitsToSats(amount.text)
+                            if (activeFocus) {
+                                channelopener.amount.isMax = checked
+                                if (checked) {
+                                    channelopener.updateMaxAmount()
+                                }
+                            }
                         }
                     }
                 }
@@ -193,10 +208,13 @@ ElDialog {
 
                 FiatField {
                     id: amountFiat
-                    btcfield: amount
+                    Layout.preferredWidth: amountFontMetrics.advanceWidth('0') * 14 + leftPadding + rightPadding
+                    btcfield: amountBtc
                     visible: Daemon.fx.enabled
-                    Layout.preferredWidth: parent.width /3
-                    enabled: !is_max.checked
+                    readOnly: is_max.checked
+                    color: readOnly
+                        ? Material.accentColor
+                        : Material.foreground
                 }
 
                 Label {
@@ -207,15 +225,30 @@ ElDialog {
                 }
 
                 Item { visible: Daemon.fx.enabled ; height: 1; width: 1 }
+
+                InfoTextArea {
+                    id: warning
+                    Layout.topMargin: constants.paddingMedium
+                    Layout.fillWidth: true
+                    Layout.columnSpan: 3
+                    text: channelopener.warning
+                    visible: text
+                    compact: true
+                    backgroundColor: constants.darkerDialogBackground
+                }
+
             }
         }
 
-        FlatButton {
+        DialogButtonContainer {
             Layout.fillWidth: true
-            text: qsTr('Open Channel')
-            icon.source: '../../icons/confirmed.png'
-            enabled: channelopener.valid
-            onClicked: channelopener.openChannel()
+            FlatButton {
+                Layout.fillWidth: true
+                text: qsTr('Open Channel...')
+                icon.source: '../../icons/confirmed.png'
+                enabled: channelopener.valid
+                onClicked: channelopener.openChannel()
+            }
         }
     }
 
@@ -265,7 +298,7 @@ ElDialog {
         }
         onChannelOpening: (peer) => {
             console.log('Channel is opening')
-            app.channelOpenProgressDialog.reset()
+            app.channelOpenProgressDialog.resetDialog()
             app.channelOpenProgressDialog.peer = peer
             app.channelOpenProgressDialog.open()
         }
@@ -290,4 +323,12 @@ ElDialog {
         }
     }
 
+    FontMetrics {
+        id: amountFontMetrics
+        font: amountBtc.font
+    }
+    FontMetrics {
+        id: nodeUriFontMetrics
+        font: nodeUri.font
+    }
 }

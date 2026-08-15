@@ -24,11 +24,11 @@
 # SOFTWARE.
 from collections import defaultdict
 from math import floor, log10
-from typing import NamedTuple, List, Callable, Sequence, Union, Dict, Tuple, Mapping, Type, TYPE_CHECKING
+from typing import NamedTuple, List, Callable, Sequence, Dict, Tuple, Mapping, Type, TYPE_CHECKING
 from decimal import Decimal
 
 from .bitcoin import sha256, COIN, is_address
-from .transaction import Transaction, TxOutput, PartialTransaction, PartialTxInput, PartialTxOutput
+from .transaction import Transaction, PartialTransaction, PartialTxInput, PartialTxOutput
 from .util import NotEnoughFunds
 from .logging import Logger
 
@@ -90,7 +90,7 @@ class ScoredCandidate(NamedTuple):
     buckets: List[Bucket]
 
 
-def strip_unneeded(bkts: List[Bucket], sufficient_funds) -> List[Bucket]:
+def strip_unneeded(bkts: List[Bucket], sufficient_funds: Callable) -> List[Bucket]:
     '''Remove buckets that are unnecessary in achieving the spend amount'''
     if sufficient_funds([], bucket_value_sum=0):
         # none of the buckets are needed
@@ -113,7 +113,12 @@ class CoinChooserBase(Logger):
     def keys(self, coins: Sequence[PartialTxInput]) -> Sequence[str]:
         raise NotImplementedError
 
-    def bucketize_coins(self, coins: Sequence[PartialTxInput], *, fee_estimator_vb):
+    def bucketize_coins(
+        self,
+        coins: Sequence[PartialTxInput],
+        *,
+        fee_estimator_vb: Callable[[int | float | Decimal], int],
+    ):
         keys = self.keys(coins)
         buckets = defaultdict(list)  # type: Dict[str, List[PartialTxInput]]
         for key, coin in zip(keys, coins):
@@ -151,9 +156,12 @@ class CoinChooserBase(Logger):
 
         return list(map(make_Bucket, buckets.keys(), buckets.values()))
 
-    def penalty_func(self, base_tx, *,
-                     tx_from_buckets: Callable[[List[Bucket]], Tuple[PartialTransaction, List[PartialTxOutput]]]) \
-            -> Callable[[List[Bucket]], ScoredCandidate]:
+    def penalty_func(
+        self,
+        base_tx: Transaction,
+        *,
+        tx_from_buckets: Callable[[List[Bucket]], Tuple[PartialTransaction, List[PartialTxOutput]]],
+    ) -> Callable[[List[Bucket]], ScoredCandidate]:
         raise NotImplementedError
 
     def _change_amounts(self, tx: PartialTransaction, count: int, fee_estimator_numchange) -> List[int]:
@@ -201,7 +209,10 @@ class CoinChooserBase(Logger):
         # Last change output.  Round down to maximum precision but lose
         # no more than 10**max_dp_to_round_for_privacy
         # e.g. a max of 2 decimal places means losing 100 satoshis to fees
-        max_dp_to_round_for_privacy = 2 if self.enable_output_value_rounding else 0
+        # don't round if the fee estimator is set to 0 fixed fee, so a 0 fee tx remains a 0 fee tx
+        is_zero_fee_tx = True if fee_estimator_numchange(1) == 0 else False
+        output_value_rounding = self.enable_output_value_rounding and not is_zero_fee_tx
+        max_dp_to_round_for_privacy = 2 if output_value_rounding else 0
         N = int(pow(10, min(max_dp_to_round_for_privacy, zeroes[0])))
         amount = (remaining // N) * N
         amounts.append(amount)
@@ -279,7 +290,7 @@ class CoinChooserBase(Logger):
             inputs: List[PartialTxInput],
             outputs: List[PartialTxOutput],
             change_addrs: Sequence[str],
-            fee_estimator_vb: Callable,
+            fee_estimator_vb: Callable[[int | float | Decimal], int],
             dust_threshold: int,
             BIP69_sort: bool = True,
     ) -> PartialTransaction:
@@ -298,6 +309,9 @@ class CoinChooserBase(Logger):
         utxos = [c.prevout.serialize_to_network() for c in coins]
         self.p = PRNG(b''.join(sorted(utxos)))
 
+        assert len(outputs) > 0 or len(change_addrs) == 1, \
+            "sweeps with 0 outputs should not use multiple change addresses"
+
         # Copy the outputs so when adding change we don't modify "outputs"
         base_tx = PartialTransaction.from_io(inputs[:], outputs[:], BIP69_sort=BIP69_sort)
         input_value = base_tx.input_value()
@@ -308,12 +322,15 @@ class CoinChooserBase(Logger):
         # marker and flag are excluded, which is compensated in get_tx_weight()
         # FIXME calculation will be off by this (2 wu) in case of RBF batching
         base_weight = base_tx.estimated_weight()
-        spent_amount = base_tx.output_value()
+        # by setting spent_amount = dust_threshold if there are no outputs we ensure that
+        # enough inputs are added so there is always at least a change output created
+        # as txs have to have at least 1 output according to consensus rules
+        spent_amount = base_tx.output_value() if outputs else dust_threshold
 
         def fee_estimator_w(weight):
             return fee_estimator_vb(Transaction.virtual_size_from_weight(weight))
 
-        def sufficient_funds(buckets, *, bucket_value_sum):
+        def sufficient_funds(buckets: List[Bucket], *, bucket_value_sum: int) -> bool:
             '''Given a list of buckets, return True if it has enough
             value to pay for the transaction'''
             # assert bucket_value_sum == sum(bucket.value for bucket in buckets)  # expensive!
@@ -364,7 +381,11 @@ class CoinChooserBase(Logger):
 
 class CoinChooserRandom(CoinChooserBase):
 
-    def bucket_candidates_any(self, buckets: List[Bucket], sufficient_funds) -> List[List[Bucket]]:
+    def bucket_candidates_any(
+        self,
+        buckets: List[Bucket],
+        sufficient_funds: Callable,
+    ) -> List[List[Bucket]]:
         '''Returns a list of bucket sets.'''
         if not buckets:
             if sufficient_funds([], bucket_value_sum=0):
@@ -402,8 +423,11 @@ class CoinChooserRandom(CoinChooserBase):
         candidates = [[buckets[n] for n in c] for c in candidates]
         return [strip_unneeded(c, sufficient_funds) for c in candidates]
 
-    def bucket_candidates_prefer_confirmed(self, buckets: List[Bucket],
-                                           sufficient_funds) -> List[List[Bucket]]:
+    def bucket_candidates_prefer_confirmed(
+        self,
+        buckets: List[Bucket],
+        sufficient_funds: Callable,
+    ) -> List[List[Bucket]]:
         """Returns a list of bucket sets preferring confirmed coins.
 
         Any bucket can be:
@@ -426,7 +450,7 @@ class CoinChooserRandom(CoinChooserBase):
         for bkts_choose_from in bucket_sets:
             try:
                 def sfunds(
-                    bkts, *, bucket_value_sum,
+                    bkts: List[Bucket], *, bucket_value_sum: int,
                     already_selected_buckets_value_sum=already_selected_buckets_value_sum,
                     already_selected_buckets=already_selected_buckets,
                 ):
@@ -503,11 +527,13 @@ COIN_CHOOSERS = {
     'Privacy': CoinChooserPrivacy,
 }  # type: Mapping[str, Type[CoinChooserBase]]
 
+
 def get_name(config: 'SimpleConfig') -> str:
     kind = config.WALLET_COIN_CHOOSER_POLICY
     if kind not in COIN_CHOOSERS:
         kind = config.cv.WALLET_COIN_CHOOSER_POLICY.get_default_value()
     return kind
+
 
 def get_coin_chooser(config: 'SimpleConfig') -> CoinChooserBase:
     klass = COIN_CHOOSERS[get_name(config)]

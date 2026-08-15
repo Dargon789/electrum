@@ -23,21 +23,21 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import hashlib
-from typing import List, Tuple, TYPE_CHECKING, Optional, Union, Sequence, Any
+from typing import Tuple, TYPE_CHECKING, Optional, Union, Sequence, Mapping, Any
 import enum
 from enum import IntEnum, Enum
 
 import electrum_ecc as ecc
+from electrum_ecc.util import bip340_tagged_hash
 
 from .util import bfh, BitcoinException, assert_bytes, to_bytes, inv_dict, is_hex_str, classproperty
-from . import version
 from . import segwit_addr
 from . import constants
-from .crypto import sha256d, sha256, hash_160, hmac_oneshot
+from .crypto import sha256d, sha256, hash_160
 
 if TYPE_CHECKING:
     from .network import Network
+    from .transaction import OPPushDataGeneric
 
 
 ################################## transactions
@@ -296,12 +296,18 @@ def construct_witness(items: Sequence[Union[str, int, bytes]]) -> bytes:
     return bytes(witness)
 
 
-def construct_script(items: Sequence[Union[str, int, bytes, opcodes]], values=None) -> bytes:
+def construct_script(
+    items: Sequence[Union[str, int, bytes, opcodes, 'OPPushDataGeneric']],
+    *,
+    values: Optional[Mapping[int, Any]] = None,  # can be used to substitute into OPPushDataGeneric
+) -> bytes:
     """Constructs bitcoin script from given items."""
+    from .transaction import OPPushDataGeneric
     script = bytearray()
     values = values or {}
     for i, item in enumerate(items):
         if i in values:
+            assert OPPushDataGeneric.is_instance(item), f"tried to substitute into {item=!r}"
             item = values[i]
         if isinstance(item, opcodes):
             script += bytes([item])
@@ -313,20 +319,20 @@ def construct_script(items: Sequence[Union[str, int, bytes, opcodes]], values=No
             assert is_hex_str(item)
             script += push_script(bfh(item))
         else:
-            raise Exception(f'unexpected item for script: {item!r}')
+            raise Exception(f'unexpected item for script: {item!r} at idx={i}')
     return bytes(script)
 
 
 def relayfee(network: 'Network' = None) -> int:
     """Returns feerate in sat/kbyte."""
-    from .simple_config import FEERATE_DEFAULT_RELAY, FEERATE_MAX_RELAY
+    from .fee_policy import FEERATE_MIN_RELAY, FEERATE_DEFAULT_RELAY, FEERATE_MAX_RELAY
     if network and network.relay_fee is not None:
         fee = network.relay_fee
     else:
         fee = FEERATE_DEFAULT_RELAY
     # sanity safeguards, as network.relay_fee is coming from a server:
     fee = min(fee, FEERATE_MAX_RELAY)
-    fee = max(fee, FEERATE_DEFAULT_RELAY)
+    fee = max(fee, FEERATE_MIN_RELAY)
     return fee
 
 
@@ -341,10 +347,7 @@ DUST_LIMIT_P2WPKH = 294
 
 def dust_threshold(network: 'Network' = None) -> int:
     """Returns the dust limit in satoshis."""
-    # Change <= dust threshold is added to the tx fee
-    dust_lim = 182 * 3 * relayfee(network)  # in msat
-    # convert to sat, but round up:
-    return (dust_lim // 1000) + (dust_lim % 1000 > 0)
+    return DUST_LIMIT_P2PKH
 
 
 def hash_encode(x: bytes) -> str:
@@ -375,12 +378,15 @@ def hash160_to_p2pkh(h160: bytes, *, net=None) -> str:
     if net is None: net = constants.net
     return hash160_to_b58_address(h160, net.ADDRTYPE_P2PKH)
 
+
 def hash160_to_p2sh(h160: bytes, *, net=None) -> str:
     if net is None: net = constants.net
     return hash160_to_b58_address(h160, net.ADDRTYPE_P2SH)
 
+
 def public_key_to_p2pkh(public_key: bytes, *, net=None) -> str:
     return hash160_to_p2pkh(hash_160(public_key), net=net)
+
 
 def hash_to_segwit_addr(h: bytes, witver: int, *, net=None) -> str:
     if net is None: net = constants.net
@@ -388,15 +394,19 @@ def hash_to_segwit_addr(h: bytes, witver: int, *, net=None) -> str:
     assert addr is not None
     return addr
 
+
 def public_key_to_p2wpkh(public_key: bytes, *, net=None) -> str:
     return hash_to_segwit_addr(hash_160(public_key), witver=0, net=net)
+
 
 def script_to_p2wsh(script: bytes, *, net=None) -> str:
     return hash_to_segwit_addr(sha256(script), witver=0, net=net)
 
+
 def p2wsh_nested_script(witness_script: bytes) -> bytes:
     wsh = sha256(witness_script)
     return construct_script([0, wsh])
+
 
 def pubkey_to_address(txin_type: str, pubkey: str, *, net=None) -> str:
     from . import descriptor
@@ -429,7 +439,7 @@ def script_to_address(script: bytes, *, net=None) -> Optional[str]:
 def address_to_script(addr: str, *, net=None) -> bytes:
     if net is None: net = constants.net
     if not is_address(addr, net=net):
-        raise BitcoinException(f"invalid bitcoin address: {addr}")
+        raise BitcoinException(f"invalid bitcoin address: {neuter_bitcoin_address(addr)}")
     witver, witprog = segwit_addr.decode_segwit_address(net.SEGWIT_HRP, addr)
     if witprog is not None:
         if not (0 <= witver <= 16):
@@ -443,6 +453,17 @@ def address_to_script(addr: str, *, net=None) -> bytes:
     else:
         raise BitcoinException(f'unknown address type: {addrtype}')
     return script
+
+
+def neuter_bitcoin_address(addr: str) -> str:
+    """Truncate a bitcoin address, for display in errors that might get sent to the crash reporter,
+    to reduce harm to the user's privacy.
+    """
+    assert isinstance(addr, str), type(addr)
+    if len(addr) <= 7:
+        return addr
+    neutered_addr = addr[:5] + '..' + addr[-2:]
+    return f"{neutered_addr!r} (len={len(addr)})"
 
 
 class OnchainOutputType(Enum):
@@ -460,7 +481,7 @@ def address_to_payload(addr: str, *, net=None) -> Tuple[OnchainOutputType, bytes
     """Return (type, pubkey hash / witness program) for an address."""
     if net is None: net = constants.net
     if not is_address(addr, net=net):
-        raise BitcoinException(f"invalid bitcoin address: {addr}")
+        raise BitcoinException(f"invalid bitcoin address: {neuter_bitcoin_address(addr)}")
     witver, witprog = segwit_addr.decode_segwit_address(net.SEGWIT_HRP, addr)
     if witprog is not None:
         if witver == 0:
@@ -518,7 +539,10 @@ class BaseDecodeError(BitcoinException): pass
 
 
 def base_encode(v: bytes, *, base: int) -> str:
-    """ encode v, which is a string of bytes, to base58."""
+    """ encode v, which is a string of bytes, to base58.
+
+    note: time complexity is O(len(v)^2), due to big-int arithmetic.
+    """
     assert_bytes(v)
     if base not in (58, 43):
         raise ValueError('not supported base: {}'.format(base))
@@ -531,10 +555,11 @@ def base_encode(v: bytes, *, base: int) -> str:
     newlen = len(v)
 
     num = int.from_bytes(v, byteorder='big')
-    string = b""
+    string_rev = bytearray()
     while num:
         num, idx = divmod(num, base)
-        string = chars[idx:idx + 1] + string
+        string_rev += chars[idx:idx + 1]
+    string = string_rev[::-1]
 
     result = chars[0:1] * (origlen - newlen) + string
     return result.decode('ascii')
@@ -542,6 +567,8 @@ def base_encode(v: bytes, *, base: int) -> str:
 
 def base_decode(v: Union[bytes, str], *, base: int) -> Optional[bytes]:
     """ decode v into a string of len bytes.
+
+    note: time complexity is O(len(v)^2), due to big-int arithmetic.
 
     based on the work of David Keijser in https://github.com/keis/base58
     """
@@ -593,12 +620,12 @@ def DecodeBase58Check(psz: Union[bytes, str]) -> bytes:
 # extended WIF for segwit (used in 3.0.x; but still used internally)
 # the keys in this dict should be a superset of what Imported Wallets can import
 WIF_SCRIPT_TYPES = {
-    'p2pkh':0,
-    'p2wpkh':1,
-    'p2wpkh-p2sh':2,
-    'p2sh':5,
-    'p2wsh':6,
-    'p2wsh-p2sh':7
+    'p2pkh': 0,
+    'p2wpkh': 1,
+    'p2wpkh-p2sh': 2,
+    'p2sh': 5,
+    'p2wsh': 6,
+    'p2wsh-p2sh': 7
 }
 WIF_SCRIPT_TYPES_INV = inv_dict(WIF_SCRIPT_TYPES)
 
@@ -679,6 +706,7 @@ def address_from_private_key(sec: str) -> str:
     public_key = ecc.ECPrivkey(privkey).get_public_key_hex(compressed=compressed)
     return pubkey_to_address(txin_type, public_key)
 
+
 def is_segwit_address(addr: str, *, net=None) -> bool:
     if net is None: net = constants.net
     try:
@@ -687,6 +715,7 @@ def is_segwit_address(addr: str, *, net=None) -> bool:
         return False
     return witprog is not None
 
+
 def is_taproot_address(addr: str, *, net=None) -> bool:
     if net is None: net = constants.net
     try:
@@ -694,6 +723,7 @@ def is_taproot_address(addr: str, *, net=None) -> bool:
     except Exception as e:
         return False
     return witver == 1
+
 
 def is_b58_address(addr: str, *, net=None) -> bool:
     if net is None: net = constants.net
@@ -705,6 +735,7 @@ def is_b58_address(addr: str, *, net=None) -> bool:
     if addrtype not in [net.ADDRTYPE_P2PKH, net.ADDRTYPE_P2SH]:
         return False
     return True
+
 
 def is_address(addr: str, *, net=None) -> bool:
     return is_segwit_address(addr, net=net) \
@@ -733,6 +764,7 @@ def is_minikey(text: str) -> bool:
             and all(ord(c) in __b58chars for c in text)
             and sha256(text + '?')[0] == 0x00)
 
+
 def minikey_to_private_key(text: str) -> bytes:
     return sha256(text)
 
@@ -740,7 +772,10 @@ def minikey_to_private_key(text: str) -> bytes:
 def _get_dummy_address(purpose: str) -> str:
     return redeem_script_to_address('p2wsh', sha256(bytes(purpose, "utf8")))
 
+
 _dummy_addr_funcs = set()
+
+
 class DummyAddress:
     """dummy address for fee estimation of funding tx
     Use e.g. as: DummyAddress.CHANNEL
@@ -799,22 +834,18 @@ def taproot_tweak_seckey(seckey0: bytes, h: bytes) -> bytes:
 TapTreeLeaf = Tuple[int, bytes]
 TapTree = Union[TapTreeLeaf, Sequence['TapTree']]
 
-# FIXME just use electrum_ecc.util.bip340_tagged_hash instead
-def bip340_tagged_hash(tag: bytes, msg: bytes) -> bytes:
-    # note: _libsecp256k1.secp256k1_tagged_sha256 benchmarks about 70% slower than this (on my machine)
-    return sha256(sha256(tag) + sha256(tag) + msg)
 
 def taproot_tree_helper(script_tree: TapTree):
     if isinstance(script_tree, tuple):
         leaf_version, script = script_tree
         h = bip340_tagged_hash(b"TapLeaf", bytes([leaf_version]) + witness_push(script))
-        return ([((leaf_version, script), bytes())], h)
+        return [((leaf_version, script), bytes())], h
     left, left_h = taproot_tree_helper(script_tree[0])
     right, right_h = taproot_tree_helper(script_tree[1])
     ret = [(l, c + right_h) for l, c in left] + [(l, c + left_h) for l, c in right]
     if right_h < left_h:
         left_h, right_h = right_h, left_h
-    return (ret, bip340_tagged_hash(b"TapBranch", left_h + right_h))
+    return ret, bip340_tagged_hash(b"TapBranch", left_h + right_h)
 
 
 def taproot_output_script(internal_pubkey: bytes, *, script_tree: Optional[TapTree]) -> bytes:
@@ -850,10 +881,12 @@ def usermessage_magic(message: bytes) -> bytes:
     length = var_int(len(message))
     return b"\x18Bitcoin Signed Message:\n" + length + message
 
+
 def ecdsa_sign_usermessage(ec_privkey, message: Union[bytes, str], *, is_compressed: bool) -> bytes:
     message = to_bytes(message, 'utf8')
     msg32 = sha256d(usermessage_magic(message))
     return ec_privkey.ecdsa_sign_recoverable(msg32, is_compressed=is_compressed)
+
 
 def verify_usermessage_with_address(address: str, sig65: bytes, message: bytes, *, net=None) -> bool:
     from electrum_ecc import ECPubkey

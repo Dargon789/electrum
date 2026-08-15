@@ -3,7 +3,7 @@ import base64
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, Callable, Optional, Any
+from typing import TYPE_CHECKING, Callable, Optional, Any, Tuple
 from functools import partial
 
 from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, QTimer
@@ -13,10 +13,17 @@ from electrum.invoices import InvoiceError, PR_PAID, PR_BROADCASTING, PR_BROADCA
 from electrum.logging import get_logger
 from electrum.network import TxBroadcastError, BestEffortRequestFailed
 from electrum.transaction import PartialTransaction, Transaction
-from electrum.util import InvalidPassword, event_listener, AddTransactionException, get_asyncio_loop
+from electrum.util import (
+    InvalidPassword, event_listener, AddTransactionException, get_asyncio_loop, NotEnoughFunds, NoDynamicFeeEstimates,
+    UserFacingException,
+)
+from electrum.lnutil import MIN_FUNDING_SAT
 from electrum.plugin import run_hook
 from electrum.wallet import Multisig_Wallet
 from electrum.crypto import pw_decode_with_version_and_mac
+from electrum.fee_policy import FeePolicy, FixedFeePolicy
+
+from electrum.gui.common_qt.util import QtEventListener, qt_event_listener
 
 from .auth import AuthMixin, auth_protect
 from .qeaddresslistmodel import QEAddressCoinListModel
@@ -24,11 +31,10 @@ from .qechannellistmodel import QEChannelListModel
 from .qeinvoicelistmodel import QEInvoiceListModel, QERequestListModel
 from .qetransactionlistmodel import QETransactionListModel
 from .qetypes import QEAmount
-from .util import QtEventListener, qt_event_listener
 
 if TYPE_CHECKING:
     from electrum.wallet import Abstract_Wallet
-    from .qeinvoice import QEInvoice
+    from electrum.invoices import Invoice
 
 
 class QEWallet(AuthMixin, QObject, QtEventListener):
@@ -75,6 +81,8 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
     otpFailed = pyqtSignal([str, str], arguments=['code', 'message'])
     peersUpdated = pyqtSignal()
     seedRetrieved = pyqtSignal()
+    messageSigned = pyqtSignal([str], arguments=['signature'])
+    signMessageError = pyqtSignal([str], arguments=['error'])
 
     _network_signal = pyqtSignal(str, object)
 
@@ -99,11 +107,14 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
         self._frozenbalance = QEAmount()
         self._totalbalance = QEAmount()
         self._lightningcanreceive = QEAmount()
+        self._minchannelfunding = QEAmount(amount_sat=int(MIN_FUNDING_SAT))
         self._lightningcansend = QEAmount()
         self._lightningbalancefrozen = QEAmount()
 
         self._seed = ''
         self._seed_passphrase = ''
+
+        self._otp_on_submit = None  # type: Callable[[str], None]
 
         self.tx_notification_queue = queue.Queue()
         self.tx_notification_last_time = 0
@@ -191,18 +202,22 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
             self.invoiceStatusChanged.emit(key, status)
 
     @qt_event_listener
-    def on_event_new_transaction(self, wallet, tx):
+    def on_event_new_transaction(self, wallet: 'Abstract_Wallet', tx: Transaction):
         if wallet == self.wallet:
-            self._logger.info(f'new transaction {tx.txid()}')
+            self._logger.debug(f'new transaction {tx.txid()}')
             self.add_tx_notification(tx)
-            self.addressCoinModel.setDirty()
+            if self._addressCoinModel is not None:  # only setDirty if it was already initialized
+                self._addressCoinModel.setDirty()
             self.historyModel.setDirty()  # assuming wallet.is_up_to_date triggers after
-            self.balanceChanged.emit()
+            if self.wallet.is_up_to_date():
+                # don't update during sync as this recomputes the balance on each new tx, blocking the UI thread.
+                # on_event_wallet_updated emits balanceChanged once we are up-to-date.
+                self.balanceChanged.emit()
 
     @qt_event_listener
     def on_event_adb_tx_height_changed(self, adb, txid, old_height, new_height):
         if adb == self.wallet.adb:
-            self._logger.info(f'tx_height_changed {txid}. {old_height} -> {new_height}')
+            self._logger.debug(f'tx_height_changed {txid}. {old_height} -> {new_height}')
             self.historyModel.setDirty()  # assuming wallet.is_up_to_date triggers after
 
     @qt_event_listener
@@ -211,7 +226,8 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
         # is deleted along with multiple associated txs
         if wallet == self.wallet:
             self._logger.info(f'removed transaction {tx.txid()}')
-            self.addressCoinModel.setDirty()
+            if self._addressCoinModel is not None:
+                self._addressCoinModel.setDirty()
             self.historyModel.setDirty()
             self.balanceChanged.emit()
 
@@ -220,6 +236,7 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
         if wallet == self.wallet:
             self._logger.debug('wallet_updated')
             self.balanceChanged.emit()
+            self.historyModel.setDirty()
             self.synchronizing = not wallet.is_up_to_date()
             if not self.synchronizing:
                 self.historyModel.initModel()  # refresh if dirty
@@ -248,9 +265,12 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
             self.paymentFailed.emit(key, reason)
 
     def on_destroy(self):
+        if self not in QEWallet.__instances:
+            return
+        QEWallet.__instances.remove(self)
         self.unregister_callbacks()
 
-    def add_tx_notification(self, tx):
+    def add_tx_notification(self, tx: Transaction):
         self._logger.debug('new transaction event')
         self.tx_notification_queue.put(tx)
         if not self.notification_timer.isActive():
@@ -277,26 +297,11 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
             except queue.Empty:
                 break
 
-        config = self.wallet.config
-        # Combine the transactions if there are at least three
-        if len(txns) >= 3:
-            total_amount = 0
-            for tx in txns:
-                tx_wallet_delta = self.wallet.get_wallet_delta(tx)
-                if not tx_wallet_delta.is_relevant:
-                    continue
-                total_amount += tx_wallet_delta.delta
-            self.userNotify.emit(self.wallet, _("{} new transactions: Total amount received in the new transactions {}").format(len(txns), config.format_amount_and_units(total_amount)))
-        else:
-            for tx in txns:
-                tx_wallet_delta = self.wallet.get_wallet_delta(tx)
-                if not tx_wallet_delta.is_relevant:
-                    continue
-                self.userNotify.emit(self.wallet,
-                    _("New transaction: {}").format(config.format_amount_and_units(tx_wallet_delta.delta)))
+        for notification in self.wallet.get_user_notifications_for_new_txns(txns):
+            self.userNotify.emit(self.wallet, notification)
 
     def update_sync_progress(self):
-        if self.wallet.network.is_connected():
+        if self.wallet.network and self.wallet.network.is_connected():
             num_sent, num_answered = self.wallet.adb.get_history_sync_state_details()
             self.synchronizingProgress = \
                 ("{} ({}/{})".format(_("Synchronizing..."), num_answered, num_sent))
@@ -457,6 +462,11 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
     def canSignMessage(self):
         return not isinstance(self.wallet, Multisig_Wallet) and not self.wallet.is_watching_only()
 
+    canGetZeroconfChannelChanged = pyqtSignal()
+    @pyqtProperty(bool, notify=canGetZeroconfChannelChanged)
+    def canGetZeroconfChannel(self) -> bool:
+        return self.wallet.lnworker and self.wallet.lnworker.can_get_zeroconf_channel()
+
     @pyqtProperty(QEAmount, notify=balanceChanged)
     def frozenBalance(self):
         c, u, x = self.wallet.get_frozen_balance()
@@ -504,10 +514,18 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
             self._lightningcanreceive.satsInt = int(self.wallet.lnworker.num_sats_can_receive())
         return self._lightningcanreceive
 
+    @pyqtProperty(bool, notify=balanceChanged)
+    def isLowReserve(self):
+        return self.wallet.is_low_reserve()
+
+    @pyqtProperty(QEAmount, notify=dataChanged)
+    def minChannelFunding(self):
+        return self._minchannelfunding
+
     @pyqtProperty(int, notify=peersUpdated)
     def lightningNumPeers(self):
         if self.isLightning:
-            return self.wallet.lnworker.num_peers()
+            return self.wallet.lnworker.lnpeermgr.num_peers()
         return 0
 
     @pyqtSlot()
@@ -583,7 +601,7 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
         if cb:
             cb()
 
-    def request_otp(self, on_submit):
+    def request_otp(self, on_submit: Callable[[str], None]):
         self._otp_on_submit = on_submit
         self.otpRequested.emit()
 
@@ -596,37 +614,38 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
     def broadcast(self, tx):
         assert tx.is_complete()
 
-        def broadcast_thread():
+        async def broadcast_coro():
             self.wallet.set_broadcasting(tx, broadcasting_status=PR_BROADCASTING)
             try:
-                self._logger.info('running broadcast in thread')
-                self.wallet.network.run_from_another_thread(self.wallet.network.broadcast_transaction(tx))
+                self._logger.info('broadcasting tx in coroutine')
+                await self.wallet.network.broadcast_transaction(tx)
             except TxBroadcastError as e:
                 self._logger.error(repr(e))
                 self.broadcastFailed.emit(tx.txid(), '', e.get_message_for_gui())
-                self.wallet.set_broadcasting(tx, broadcasting_status=None)
             except BestEffortRequestFailed as e:
                 self._logger.error(repr(e))
                 self.broadcastFailed.emit(tx.txid(), '', repr(e))
-                self.wallet.set_broadcasting(tx, broadcasting_status=None)
+            except Exception:
+                self._logger.exception("failed to broadcast tx")
             else:
                 self._logger.info('broadcast success')
                 self.broadcastSucceeded.emit(tx.txid())
                 self.historyModel.requestRefresh.emit()  # via qt thread
-                self.wallet.set_broadcasting(tx, broadcasting_status=PR_BROADCAST)
+            finally:
+                self.wallet.set_broadcasting(tx, broadcasting_status=None)
 
-        threading.Thread(target=broadcast_thread, daemon=True).start()
+        asyncio.run_coroutine_threadsafe(broadcast_coro(), get_asyncio_loop())
 
         # TODO: properly catch server side errors, e.g. bad-txns-inputs-missingorspent
 
-    def save_tx(self, tx: 'PartialTransaction'):
+    def save_tx(self, tx: 'PartialTransaction') -> bool:
         assert tx
 
         try:
             if not self.wallet.adb.add_transaction(tx):
                 self.saveTxError.emit(tx.txid(), 'conflict',
                             _("Transaction could not be saved.") + "\n" + _("It conflicts with current history."))
-                return
+                return False
             self.wallet.save_db()
             self.saveTxSuccess.emit(tx.txid())
             self.historyModel.initModel(True)
@@ -639,19 +658,32 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
         self.paymentAuthRejected.emit()
 
     @auth_protect(message=_('Pay lightning invoice?'), reject='ln_auth_rejected')
-    def pay_lightning_invoice(self, invoice: 'QEInvoice'):
-        amount_msat = invoice.get_amount_msat()
+    def pay_lightning_invoice(self, invoice: 'Invoice', amount_msat: int = None):
+        # at this point, the user confirmed the payment, potentially with an override amount.
+        # we save the invoice with the override amount if there was no amount defined in the invoice.
+        # (this is similar to what the desktop client does)
+        #
+        # Note: amount_msat can be greater than the invoice-specified amount. This is validated and handled
+        # in lnworker.pay_invoice()
+        if amount_msat is not None:
+            assert type(amount_msat) is int
+            if invoice.get_amount_msat() is None:
+                invoice.set_amount_msat(amount_msat)
+        else:
+            amount_msat = invoice.get_amount_msat()
 
-        def pay_thread():
+        self.wallet.save_invoice(invoice)
+        if self._invoiceModel:
+            self._invoiceModel.initModel()
+
+        async def pay_coro():
             try:
-                coro = self.wallet.lnworker.pay_invoice(invoice.lightning_invoice, amount_msat=amount_msat)
-                fut = asyncio.run_coroutine_threadsafe(coro, get_asyncio_loop())
-                fut.result()
+                await self.wallet.lnworker.pay_invoice(invoice, amount_msat=amount_msat)
             except Exception as e:
                 self._logger.error(f'pay_invoice failed! {e!r}')
                 self.paymentFailed.emit(invoice.get_id(), str(e))
 
-        threading.Thread(target=pay_thread, daemon=True).start()
+        asyncio.run_coroutine_threadsafe(pay_coro(), get_asyncio_loop())
 
     @pyqtSlot()
     def deleteExpiredRequests(self):
@@ -663,24 +695,25 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
     @pyqtSlot(QEAmount, str, int, bool)
     @pyqtSlot(QEAmount, str, int, bool, bool)
     @pyqtSlot(QEAmount, str, int, bool, bool, bool)
-    def createRequest(self, amount: QEAmount, message: str, expiration: int, lightning_only: bool = False, reuse_address: bool = False):
+    def createRequest(self, amount: QEAmount, message: str, expiration: int, lightning: bool = False, reuse_address: bool = False):
         self.deleteExpiredRequests()
         try:
             amount = amount.satsInt
-            addr = self.wallet.get_unused_address()
-            if addr is None:
-                if reuse_address:
-                    addr = self.wallet.get_receiving_address()
-                elif lightning_only:
-                    addr = None
-                else:
-                    msg = [
-                        _('No address available.'),
-                        _('All your addresses are used in pending requests.'),
-                        _('To see the list, press and hold the Receive button.'),
-                    ]
-                    self.requestCreateError.emit(' '.join(msg))
-                    return
+            if not lightning:
+                addr = self.wallet.get_unused_address()
+                if addr is None:
+                    if reuse_address:
+                        addr = self.wallet.get_receiving_address()
+                    else:
+                        msg = [
+                            _('No address available.'),
+                            _('All your addresses are used in pending requests.'),
+                            _('To see the list, press and hold the Receive button.'),
+                        ]
+                        self.requestCreateError.emit(' '.join(msg))
+                        return
+            else:
+                addr = None
 
             key = self.wallet.create_request(amount, message, expiration, addr)
         except InvoiceError as e:
@@ -731,6 +764,7 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
         try:
             self._logger.info('setting new password')
             self.wallet.update_password(current_password, password, encrypt_storage=True)
+            # restore the invariant that all loaded wallets in qml must be unlocked:
             self.wallet.unlock(password)
             return True
         except InvalidPassword as e:
@@ -798,22 +832,47 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
 
     @pyqtSlot(result='QVariantMap')
     def getBalancesForPiechart(self):
-        confirmed, unconfirmed, unmatured, frozen, lightning, f_lightning = balances = self.wallet.get_balances_for_piechart()
+        p_bal = self.wallet.get_balances_for_piechart()
         return {
-            'confirmed': confirmed,
-            'unconfirmed': unconfirmed,
-            'unmatured': unmatured,
-            'frozen': frozen,
-            'lightning': int(lightning),
-            'f_lightning': int(f_lightning),
-            'total': sum([int(x) for x in list(balances)])
+            'confirmed': p_bal.confirmed,
+            'unconfirmed': p_bal.unconfirmed,
+            'unmatured': p_bal.unmatured,
+            'frozen': p_bal.frozen,
+            'lightning': int(p_bal.lightning),
+            'f_lightning': int(p_bal.lightning_frozen),
+            'total': int(p_bal.total())
         }
 
     @pyqtSlot(str, result=bool)
     def isAddressMine(self, addr):
         return self.wallet.is_mine(addr)
 
-    @pyqtSlot(str, str, result=str)
+    @pyqtSlot(str, str)
+    @auth_protect(message=_("Sign message?"))
     def signMessage(self, address, message):
-        sig = self.wallet.sign_message(address, message, self.password)
-        return base64.b64encode(sig).decode('ascii')
+        try:
+            sig = self.wallet.sign_message(address=address, message=message, password=self.password)
+        except UserFacingException as e:
+            self.signMessageError.emit(str(e))
+            return
+        result = base64.b64encode(sig).decode('ascii')
+        self.messageSigned.emit(result)
+
+    def determine_max(self, *, mktx: Callable[[FeePolicy], PartialTransaction]) -> Tuple[Optional[int], Optional[str]]:
+        # TODO: merge with SendTab.spend_max() and move to backend wallet
+        amount = message = None
+        try:
+            try:
+                fee_policy = FeePolicy(self.wallet.config.FEE_POLICY)
+                tx = mktx(fee_policy)
+            except (NotEnoughFunds, NoDynamicFeeEstimates) as e:
+                # Check if we had enough funds excluding fees,
+                # if so, still provide opportunity to set lower fees.
+                fee_policy = FixedFeePolicy(0)
+                tx = mktx(fee_policy)
+            amount = tx.output_value()
+        except NotEnoughFunds as e:
+            self._logger.debug(str(e))
+            message = self.wallet.get_text_not_enough_funds_mentioning_frozen(for_amount='!')
+
+        return amount, message

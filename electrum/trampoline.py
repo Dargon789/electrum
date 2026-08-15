@@ -1,15 +1,26 @@
 import io
 import os
 import random
-from typing import Mapping, DefaultDict, Tuple, Optional, Dict, List, Iterable, Sequence, Set, Any
+import dataclasses
+from fractions import Fraction
+from typing import Mapping, Tuple, Optional, List, Iterable, Sequence, Set, Any, TYPE_CHECKING
+from types import MappingProxyType
 
-from .lnutil import LnFeatures, PaymentFeeBudget
-from .lnonion import calc_hops_data_for_payment, new_onion_packet, OnionPacket
-from .lnrouter import RouteEdge, TrampolineEdge, LNPaymentRoute, is_route_within_budget, LNPaymentTRoute
+import electrum_ecc as ecc
+
+from .lnutil import LnFeatures, PaymentFeeBudget, FeeBudgetExceeded
+from .lnonion import (
+    calc_hops_data_for_payment, new_onion_packet, OnionPacket
+)
+from .lnrouter import TrampolineEdge, is_route_within_budget, LNPaymentTRoute
 from .lnutil import NoPathFound
 from .lntransport import LNPeerAddr
 from . import constants
 from .logging import get_logger
+from .util import random_shuffled_copy
+
+if TYPE_CHECKING:
+    from .lnchannel import Channel
 
 
 _logger = get_logger(__name__)
@@ -30,11 +41,52 @@ TRAMPOLINE_NODES_TESTNET = {
 TRAMPOLINE_NODES_TESTNET4 = {}
 
 TRAMPOLINE_NODES_SIGNET = {
-    'lnd wakiyamap.dev': LNPeerAddr(host='signet-electrumx.wakiyamap.dev', port=9735, pubkey=bytes.fromhex('02dadf6c28f3284d591cd2a4189d1530c1ff82c07059ebea150a33ab76e7364b4a')),
     'eclair wakiyamap.dev': LNPeerAddr(host='signet-eclair.wakiyamap.dev', port=9735, pubkey=bytes.fromhex('0271cf3881e6eadad960f47125434342e57e65b98a78afa99f9b4191c02dd7ab3b')),
 }
 
 _TRAMPOLINE_NODES_UNITTESTS = {}  # used in unit tests
+
+TRAMPOLINE_HOPS_MAX_DATA_SIZE = 500
+LAZY_TRAMPOLINE_MAGIC = b'lazy'
+LAZY_TRAMPOLINE_VERSION = b'\x00'
+
+def encode_next_trampolines(trampoline_channels: Iterable['Channel']) -> bytes:
+    s = LAZY_TRAMPOLINE_MAGIC + LAZY_TRAMPOLINE_VERSION
+    # max 5 channels because of onion error size limit
+    for chan in list(trampoline_channels)[:5]:
+        s += chan.node_id
+        s += int.to_bytes(chan.forwarding_fee_base_msat, length=4, byteorder="big", signed=False)
+        s += int.to_bytes(chan.forwarding_fee_proportional_millionths, length=4, byteorder="big", signed=False)
+        s += int.to_bytes(chan.forwarding_cltv_delta, length=2, byteorder="big", signed=False)
+    return s
+
+def decode_next_trampolines(data: bytes) -> dict:
+    with io.BytesIO(bytes(data)) as s:
+        magic = s.read(4)
+        if magic != LAZY_TRAMPOLINE_MAGIC:
+            return {}
+        version = s.read(1)
+        if version != LAZY_TRAMPOLINE_VERSION:
+            return {}
+        next_trampolines = {}
+        while True:
+            node_id = s.read(33)
+            feebase = s.read(4)
+            feerate = s.read(4)
+            cltv = s.read(2)
+            if len(cltv) != 2:
+                break  # EOF
+            feebase = int.from_bytes(feebase, byteorder="big")
+            feerate = int.from_bytes(feerate, byteorder="big")
+            cltv = int.from_bytes(cltv, byteorder="big")
+            # check that node_id is a valid point
+            try:
+                ecc.ECPubkey(node_id)
+            except ecc.InvalidECPointException:
+                continue
+            next_trampolines[node_id] = (feebase, feerate, cltv)
+        return next_trampolines
+
 
 def hardcoded_trampoline_nodes() -> Mapping[str, LNPeerAddr]:
     if _TRAMPOLINE_NODES_UNITTESTS:
@@ -50,16 +102,19 @@ def hardcoded_trampoline_nodes() -> Mapping[str, LNPeerAddr]:
     else:
         return {}
 
+
 def trampolines_by_id():
     return dict([(x.pubkey, x) for x in hardcoded_trampoline_nodes().values()])
+
 
 def is_hardcoded_trampoline(node_id: bytes) -> bool:
     return node_id in trampolines_by_id()
 
-def encode_routing_info(r_tags: Sequence[Sequence[Sequence[Any]]]) -> bytes:
-    result = bytearray()
+
+def encode_routing_info(r_tags: Sequence[Sequence[Sequence[Any]]]) -> List[bytes]:
+    routes = []
     for route in r_tags:
-        result += bytes([len(route)])
+        result = bytes([len(route)])
         for step in route:
             pubkey, scid, feebase, feerate, cltv = step
             result += pubkey
@@ -67,7 +122,8 @@ def encode_routing_info(r_tags: Sequence[Sequence[Sequence[Any]]]) -> bytes:
             result += int.to_bytes(feebase, length=4, byteorder="big", signed=False)
             result += int.to_bytes(feerate, length=4, byteorder="big", signed=False)
             result += int.to_bytes(cltv, length=2, byteorder="big", signed=False)
-    return bytes(result)
+        routes.append(result)
+    return routes
 
 
 def decode_routing_info(rinfo: bytes) -> Sequence[Sequence[Sequence[Any]]]:
@@ -123,12 +179,14 @@ def is_legacy_relay(invoice_features, r_tags) -> Tuple[bool, Set[bytes]]:
 
 
 PLACEHOLDER_FEE = None
+
+
 def _extend_trampoline_route(
         route: List[TrampolineEdge],
         *,
         start_node: bytes = None,
         end_node: bytes,
-        pay_fees: bool = True,
+        fee_info: tuple = None,
 ):
     """Extends the route and modifies it in place."""
     if start_node is None:
@@ -139,45 +197,80 @@ def _extend_trampoline_route(
     # note: trampoline nodes are supposed to advertise their fee and cltv in node_update message.
     #       However, in the temporary spec, they do not.
     #       They also don't send their fee policy in the error message if we lowball the fee...
+    fee_base, fee_proportional, cltv_delta = fee_info if fee_info else (PLACEHOLDER_FEE, PLACEHOLDER_FEE, 576)
     route.append(
         TrampolineEdge(
             start_node=start_node,
             end_node=end_node,
-            fee_base_msat=PLACEHOLDER_FEE if pay_fees else 0,
-            fee_proportional_millionths=PLACEHOLDER_FEE if pay_fees else 0,
-            cltv_delta=576 if pay_fees else 0,
+            fee_base_msat=fee_base,
+            fee_proportional_millionths=fee_proportional,
+            cltv_delta=cltv_delta,
             node_features=trampoline_features))
 
 
-def _allocate_fee_along_route(
-    route: List[TrampolineEdge],
-    *,
-    budget: PaymentFeeBudget,
-    trampoline_fee_level: int,
-) -> None:
+def get_trampoline_budget(trampoline_fee_level: int, budget_msat: int) -> int:
     # calculate budget_to_use, based on given max available "budget"
     if trampoline_fee_level == 0:
-        budget_to_use = 0
+        return 0
     else:
         assert trampoline_fee_level > 0
         MAX_LEVEL = 6
         if trampoline_fee_level > MAX_LEVEL:
-            raise NoPathFound()
-        budget_to_use = budget.fee_msat // (2 ** (MAX_LEVEL - trampoline_fee_level))
-    _logger.debug(f"_allocate_fee_along_route(). {trampoline_fee_level=}, {budget.fee_msat=}, {budget_to_use=}")
-    # replace placeholder fees
-    for edge in route:
-        assert edge.fee_base_msat in (0, PLACEHOLDER_FEE), edge.fee_base_msat
-        assert edge.fee_proportional_millionths in (0, PLACEHOLDER_FEE), edge.fee_proportional_millionths
-    edges_to_update = [
-        edge for edge in route
-        if edge.fee_base_msat == PLACEHOLDER_FEE]
-    for edge in edges_to_update:
-        edge.fee_base_msat = budget_to_use // len(edges_to_update)
+            raise FeeBudgetExceeded("highest trampoline fee level reached")
+        return budget_msat // (2 ** (MAX_LEVEL - trampoline_fee_level))
+
+
+def _allocate_fee_budget_among_route(
+    route: Sequence[TrampolineEdge],
+    *,
+    usable_budget_msat: int,
+    amount_msat_for_dest: int,
+) -> int:
+    """
+    Assign trampoline base fee to PLACEHOLDER trampoline edges so the realized route fee stays
+    within the trampoline_fee_level's share of the payment budget (usable_budget_msat).
+
+    Let x be the placeholder base fee we solve for (equal for every placeholder edge).
+    Walking the route from destination back to source, every quantity is a linear function of x:
+        edge_fee(x)   = edge_fee_const   + edge_fee_coeff   * x
+        amt_in(x)     = amt_in_const     + amt_in_coeff     * x   # amount entering the edge
+        total_fee(x)  = total_fee_const  + total_fee_coeff  * x   # sum of edge_fee over route
+    The constraint total_fee(x) <= usable_budget_msat gives
+        x = (usable_budget_msat - total_fee_const) / total_fee_coeff
+    which we floor to an integer msat.
+    (note: the code is equivalent to the above description but has been simplified a bit)
+    """
+    placeholder_edges = [e for e in route[1:] if e.fee_base_msat == PLACEHOLDER_FEE]
+    known_edges =       [e for e in route[1:] if e.fee_base_msat != PLACEHOLDER_FEE]
+    if not placeholder_edges:
+        return 0
+
+    amt_in_const = Fraction(amount_msat_for_dest)
+    for edge in reversed(known_edges):  # only known_edges
+        amt_in_const += edge.fee_base_msat + amt_in_const * edge.fee_proportional_millionths / 1_000_000
+    budget_const = amt_in_const - amount_msat_for_dest
+    budget_remaining = Fraction(usable_budget_msat) - budget_const
+
+    amt_in_coeff = Fraction(0)
+    for edge in reversed(route[1:]):  # known_edges AND placeholder_edges
+        if edge.fee_base_msat == PLACEHOLDER_FEE:
+            amt_in_coeff += Fraction(1)
+        else:  # for a known-edge, allocate same small fee for each placeholder-edge later in path
+            amt_in_coeff += amt_in_coeff * edge.fee_proportional_millionths / 1_000_000
+
+    if budget_remaining <= 0 or amt_in_coeff <= 0:
+        placeholder_fee = 0
+    else:
+        placeholder_fee_exact = budget_remaining / amt_in_coeff
+        placeholder_fee = placeholder_fee_exact.numerator // placeholder_fee_exact.denominator  # floor
+    _logger.debug(f"_allocate_fee_along_route: {placeholder_fee=}, placeholders={len(placeholder_edges)}")
+    for edge in placeholder_edges:
+        edge.fee_base_msat = placeholder_fee
         edge.fee_proportional_millionths = 0
+    return placeholder_fee
 
 
-def _choose_second_trampoline(
+def _choose_next_trampoline(
     my_trampoline: bytes,
     trampolines: Iterable[bytes],
     failed_routes: Iterable[Sequence[str]],
@@ -187,7 +280,7 @@ def _choose_second_trampoline(
         trampolines.discard(my_trampoline)
     for r in failed_routes:
         if len(r) > 2:
-            t2 = bytes.fromhex(r[1])
+            t2 = bytes.fromhex(r[-1])
             if t2 in trampolines:
                 trampolines.discard(t2)
     if not trampolines:
@@ -205,50 +298,50 @@ def create_trampoline_route(
         my_trampoline: bytes,  # the first trampoline in the path; which we are directly connected to
         r_tags,
         trampoline_fee_level: int,
-        use_two_trampolines: bool,
+        next_trampolines: dict,
         failed_routes: Iterable[Sequence[str]],
         budget: PaymentFeeBudget,
 ) -> LNPaymentTRoute:
     # we decide whether to convert to a legacy payment
     is_legacy, invoice_trampolines = is_legacy_relay(invoice_features, r_tags)
+    # we can be in the invoice_trampolines e.g. if we have a direct channel with the recipient
+    invoice_trampolines.discard(my_pubkey)
+    _logger.debug(f"Creating trampoline route for invoice_pubkey={invoice_pubkey.hex()}, {is_legacy=}")
 
     # we build a route of trampoline hops and extend the route list in place
     route = []
 
     # our first trampoline hop is decided by the channel we use
     _extend_trampoline_route(
-        route, start_node=my_pubkey, end_node=my_trampoline,
-        pay_fees=False,
+        route, start_node=my_pubkey, end_node=my_trampoline, fee_info=(0, 0, 0)
     )
 
+    next_trampolines.pop(my_pubkey, None)
+    next_trampolines_ids = list(next_trampolines.keys())
     if is_legacy:
-        # we add another different trampoline hop for privacy
-        if use_two_trampolines:
-            trampolines = trampolines_by_id()
-            second_trampoline = _choose_second_trampoline(my_trampoline, list(trampolines.keys()), failed_routes)
-            _extend_trampoline_route(route, end_node=second_trampoline)
+        if next_trampolines:
+            trampoline_id = _choose_next_trampoline(my_trampoline, next_trampolines_ids, failed_routes)
+            _extend_trampoline_route(route, end_node=trampoline_id, fee_info = next_trampolines[trampoline_id])
         # the last trampoline onion must contain routing hints for the last trampoline
         # node to find the recipient
-        invoice_routing_info = encode_routing_info(r_tags)
-        assert invoice_routing_info == encode_routing_info(decode_routing_info(invoice_routing_info))
+        # Due to space constraints it is not guaranteed for all route hints to get included in the onion
+        invoice_routing_info: List[bytes] = encode_routing_info(r_tags)
+        assert invoice_routing_info == encode_routing_info(decode_routing_info(b''.join(invoice_routing_info)))
         # lnwire invoice_features for trampoline is u64
         invoice_features = invoice_features & 0xffffffffffffffff
         route[-1].invoice_routing_info = invoice_routing_info
         route[-1].invoice_features = invoice_features
         route[-1].outgoing_node_id = invoice_pubkey
     else:
-        if invoice_trampolines:
-            if my_trampoline in invoice_trampolines:
-                short_route = [my_trampoline.hex(), invoice_pubkey.hex()]
-                if short_route in failed_routes:
-                    add_trampoline = True
-                else:
-                    add_trampoline = False
-            else:
-                add_trampoline = True
-            if add_trampoline:
-                second_trampoline = _choose_second_trampoline(my_trampoline, invoice_trampolines, failed_routes)
-                _extend_trampoline_route(route, end_node=second_trampoline)
+        next_trampoline = my_trampoline
+        # maybe add second trampoline
+        if next_trampolines and next_trampoline not in invoice_trampolines:
+            next_trampoline = _choose_next_trampoline(next_trampoline, next_trampolines_ids, failed_routes)
+            _extend_trampoline_route(route, end_node=next_trampoline, fee_info=next_trampolines[next_trampoline])
+        # maybe add invoice trampoline
+        if invoice_trampolines and next_trampoline not in invoice_trampolines:
+            invoice_trampoline = _choose_next_trampoline(next_trampoline, invoice_trampolines, failed_routes)
+            _extend_trampoline_route(route, end_node=invoice_trampoline)
 
     # Add final edge. note: eclair requires an encrypted t-onion blob even in legacy case.
     # Also needed for fees for last TF!
@@ -256,7 +349,13 @@ def create_trampoline_route(
         _extend_trampoline_route(route, end_node=invoice_pubkey)
 
     # replace placeholder fees in route
-    _allocate_fee_along_route(route, budget=budget, trampoline_fee_level=trampoline_fee_level)
+    usable_budget_msat = get_trampoline_budget(trampoline_fee_level, budget.fee_msat)
+    _logger.debug(f"create_trampoline_route: {trampoline_fee_level=}, {usable_budget_msat=}")
+    _allocate_fee_budget_among_route(
+        route,
+        usable_budget_msat=usable_budget_msat,
+        amount_msat_for_dest=amount_msat,
+    )
 
     # check that we can pay amount and fees
     if not is_route_within_budget(
@@ -265,7 +364,7 @@ def create_trampoline_route(
         amount_msat_for_dest=amount_msat,
         cltv_delta_for_dest=min_final_cltv_delta,
     ):
-        raise NoPathFound("route exceeds budget")
+        raise FeeBudgetExceeded(f"route exceeds budget: budget: {budget}")
     return route
 
 
@@ -288,15 +387,16 @@ def create_trampoline_onion(
     # detect trampoline hops.
     payment_path_pubkeys = [x.node_id for x in route]
     num_hops = len(payment_path_pubkeys)
+    routing_info_payload_index: Optional[int] = None
     for i in range(num_hops):
         route_edge = route[i]
         assert route_edge.is_trampoline()
-        payload = hops_data[i].payload
+        payload = dict(hops_data[i].payload)
         if i < num_hops - 1:
             payload.pop('short_channel_id')
             next_edge = route[i+1]
             assert next_edge.is_trampoline()
-            hops_data[i].payload["outgoing_node_id"] = {"outgoing_node_id":next_edge.node_id}
+            payload["outgoing_node_id"] = {"outgoing_node_id": next_edge.node_id}
         # only for final
         if i == num_hops - 1:
             payload["payment_data"] = {
@@ -305,16 +405,41 @@ def create_trampoline_onion(
             }
         # legacy
         if i == num_hops - 2 and route_edge.invoice_features:
-            payload["invoice_features"] = {"invoice_features":route_edge.invoice_features}
-            payload["invoice_routing_info"] = {"invoice_routing_info":route_edge.invoice_routing_info}
+            payload["invoice_features"] = {"invoice_features": route_edge.invoice_features}
+            routing_info_payload_index = i
             payload["payment_data"] = {
                 "payment_secret": payment_secret,
                 "total_msat": total_msat
             }
+        hops_data[i] = dataclasses.replace(hops_data[i], payload=payload)
+
+    if (index := routing_info_payload_index) is not None:
+        # fill the remaining payload space with available routing hints (r_tags)
+        payload = dict(hops_data[index].payload)
+        # try different r_tag order on each attempt
+        invoice_routing_info = random_shuffled_copy(route[index].invoice_routing_info)
+        remaining_payload_space = TRAMPOLINE_HOPS_MAX_DATA_SIZE - sum(len(hop.to_bytes()) for hop in hops_data)
+        routing_info_to_use = []
+        for encoded_r_tag in invoice_routing_info:
+            if remaining_payload_space < 50:
+                break  # no r_tag will fit here anymore
+            r_tag_size = len(encoded_r_tag)
+            if r_tag_size > remaining_payload_space:
+                continue
+            routing_info_to_use.append(encoded_r_tag)
+            remaining_payload_space -= r_tag_size
+        # add the chosen r_tags to the payload
+        payload["invoice_routing_info"] = {"invoice_routing_info": b''.join(routing_info_to_use)}
+        hops_data[index] = dataclasses.replace(hops_data[index], payload=payload)
+        _logger.debug(f"Using {len(routing_info_to_use)} of {len(invoice_routing_info)} r_tags")
+
     trampoline_session_key = os.urandom(32)
     trampoline_onion = new_onion_packet(payment_path_pubkeys, trampoline_session_key, hops_data, associated_data=payment_hash, trampoline=True)
-    trampoline_onion._debug_hops_data = hops_data
-    trampoline_onion._debug_route = route
+    trampoline_onion = dataclasses.replace(
+        trampoline_onion,
+        _debug_hops_data=hops_data,
+        _debug_route=route,
+    )
     return trampoline_onion, amount_msat, cltv_abs
 
 
@@ -332,7 +457,7 @@ def create_trampoline_route_and_onion(
         payment_secret: bytes,
         local_height: int,
         trampoline_fee_level: int,
-        use_two_trampolines: bool,
+        next_trampolines: dict,
         failed_routes: Iterable[Sequence[str]],
         budget: PaymentFeeBudget,
 ) -> Tuple[LNPaymentTRoute, OnionPacket, int, int]:
@@ -346,7 +471,7 @@ def create_trampoline_route_and_onion(
         my_trampoline=node_id,
         r_tags=r_tags,
         trampoline_fee_level=trampoline_fee_level,
-        use_two_trampolines=use_two_trampolines,
+        next_trampolines=next_trampolines,
         failed_routes=failed_routes,
         budget=budget,
     )

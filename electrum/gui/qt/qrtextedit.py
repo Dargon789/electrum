@@ -6,7 +6,7 @@ from electrum.plugin import run_hook
 from electrum.simple_config import SimpleConfig
 
 from .util import ButtonsTextEdit, MessageBoxMixin, ColorScheme, read_QIcon
-from .util import get_iconname_camera, get_iconname_qrcode
+from .util import get_icon_camera, get_icon_qrcode, add_input_actions_to_context_menu
 
 
 class ShowQRTextEdit(ButtonsTextEdit):
@@ -19,7 +19,7 @@ class ShowQRTextEdit(ButtonsTextEdit):
 
     def contextMenuEvent(self, e):
         m = self.createStandardContextMenu()
-        m.addAction(read_QIcon(get_iconname_qrcode()), _("Show as QR code"), self.on_qr_show_btn)
+        m.addAction(get_icon_qrcode(), _("Show as QR code"), self.on_qr_show_btn)
         m.exec(e.globalPos())
 
 
@@ -47,6 +47,13 @@ class ScanQRTextEdit(ButtonsTextEdit, MessageBoxMixin):
             show_error=self.show_error,
             setText=setText,
         )
+        self.on_qr_from_file_input_btn = partial(
+            self.input_qr_from_file,
+            allow_multi=allow_multi,
+            config=config,
+            show_error=self.show_error,
+            setText=setText,
+        )
         self.on_input_file = partial(
             self.input_file,
             config=config,
@@ -62,7 +69,8 @@ class ScanQRTextEdit(ButtonsTextEdit, MessageBoxMixin):
         self.add_menu_button(
             options=[
                 ("picture_in_picture.png", _("Read QR code from screen"), self.on_qr_from_screenshot_input_btn),
-                ("file.png",               _("Read file"),                self.on_input_file),
+                ("qr_file.png",            _("Read QR code from file"),   self.on_qr_from_file_input_btn),
+                ("file.png",               _("Read text from file"),      self.on_input_file),
             ],
         )
         self.add_qr_input_from_camera_button(config=config, show_error=self.show_error, allow_multi=allow_multi, setText=setText)
@@ -70,26 +78,20 @@ class ScanQRTextEdit(ButtonsTextEdit, MessageBoxMixin):
     def contextMenuEvent(self, e):
         m = self.createStandardContextMenu()
         m.addSeparator()
-        m.addAction(read_QIcon(get_iconname_camera()),    _("Read QR code with camera"), self.on_qr_from_camera_input_btn)
-        m.addAction(read_QIcon("picture_in_picture.png"), _("Read QR code from screen"), self.on_qr_from_screenshot_input_btn)
-        m.addAction(read_QIcon("file.png"), _("Read file"), self.on_input_file)
+        add_input_actions_to_context_menu(self, m)
         m.exec(e.globalPos())
 
 
-class ScanShowQRTextEdit(ButtonsTextEdit, MessageBoxMixin):
+class ScanShowQRTextEdit(ScanQRTextEdit):
 
-    def __init__(self, text="", allow_multi: bool = False, *, config: SimpleConfig):
-        ButtonsTextEdit.__init__(self, text)
-        self.setReadOnly(False)
-        self.add_qr_input_combined_button(config=config, show_error=self.show_error, allow_multi=allow_multi)
+    def __init__(self, *args, config: SimpleConfig, **kwargs):
+        ScanQRTextEdit.__init__(self, *args, **kwargs, config=config)
         self.add_qr_show_button(config=config)
-        run_hook('scan_text_edit', self)
         run_hook('show_text_edit', self)
 
     def contextMenuEvent(self, e):
         m = self.createStandardContextMenu()
         m.addSeparator()
-        m.addAction(read_QIcon(get_iconname_camera()),    _("Read QR code from camera"), self.on_qr_from_camera_input_btn)
-        m.addAction(read_QIcon("picture_in_picture.png"), _("Read QR code from screen"), self.on_qr_from_screenshot_input_btn)
-        m.addAction(read_QIcon(get_iconname_qrcode()),    _("Show as QR code"),          self.on_qr_show_btn)
+        add_input_actions_to_context_menu(self, m)
+        m.addAction(get_icon_qrcode(), _("Show as QR code"), self.on_qr_show_btn)
         m.exec(e.globalPos())

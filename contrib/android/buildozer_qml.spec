@@ -35,14 +35,17 @@ source.exclude_dirs =
     electrum/plugins/bitbox02,
     electrum/plugins/coldcard,
     electrum/plugins/digitalbitbox,
-    electrum/plugins/hw_wallet,
     electrum/plugins/jade,
     electrum/plugins/keepkey,
     electrum/plugins/ledger,
-    electrum/plugins/trezor,
+    electrum/plugins/nwc,
     electrum/plugins/payserver,
     electrum/plugins/revealer,
     electrum/plugins/safe_t,
+    electrum/plugins/swapserver,
+    electrum/plugins/timelock_recovery,
+    electrum/plugins/trezor,
+    electrum/plugins/watchtower,
     packages/qdarkstyle,
     packages/qtpy,
     packages/bin,
@@ -73,10 +76,9 @@ requirements =
     plyer,
     libffi,
     libsecp256k1,
-    cryptography,
+    pycryptodomex,
     pyqt6sip,
     pyqt6,
-    pillow,
     libzbar
 
 # (str) Presplash of the application
@@ -99,23 +101,23 @@ fullscreen = False
 #
 
 # (list) Permissions
-android.permissions = INTERNET, CAMERA, WRITE_EXTERNAL_STORAGE
+android.permissions = INTERNET, CAMERA, WRITE_EXTERNAL_STORAGE, POST_NOTIFICATIONS, USE_BIOMETRIC
 
 # (int) Android API to use  (compileSdkVersion)
 # note: when changing, Dockerfile also needs to be changed to install corresponding build tools
-android.api = 31
+android.api = 36
 
 # (int) Android targetSdkVersion
-android.target_sdk_version = 34
+android.target_sdk_version = 36
 
 # (int) Minimum API required. You will need to set the android.ndk_api to be as low as this value.
-android.minapi = 23
+android.minapi = 26
 
 # (str) Android NDK version to use
-android.ndk = 23b
+android.ndk = 28c
 
 # (int) Android NDK API to use (optional). This is the minimum API your app will support.
-android.ndk_api = 23
+android.ndk_api = 26
 
 # (bool) Use --private data storage (True) or --dir public storage (False)
 #android.private_storage = True
@@ -154,15 +156,22 @@ android.accept_sdk_license = True
 android.add_jars = .buildozer/android/platform/*/build/libs_collections/Electrum/jar/*.jar
 
 
+android.add_aars =
+    contrib/android/.cache/aars/BarcodeScannerView.aar,
+    contrib/android/.cache/aars/CameraView.aar,
+    contrib/android/.cache/aars/zxing-cpp.aar
+
+
 # (list) List of Java files to add to the android project (can be java or a
 # directory containing the files)
 android.add_src = electrum/gui/qml/java_classes/
 
+# kotlin-stdlib is required for zxing-cpp (BarcodeScannerView)
 android.gradle_dependencies =
-    com.android.support:support-compat:28.0.0,
-    me.dm7.barcodescanner:zxing:1.9.8
+    androidx.core:core:1.16.0,
+    org.jetbrains.kotlin:kotlin-stdlib:1.8.22
 
-android.add_activities = org.electrum.qr.SimpleScannerActivity
+android.add_activities = org.electrum.qr.SimpleScannerActivity, org.electrum.biometry.BiometricActivity
 
 # (list) Put these files or directories in the apk res directory.
 # The option may be used in three ways, the value may contain one or zero ':'

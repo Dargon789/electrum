@@ -84,18 +84,6 @@ Pane {
                             columns: 2
                             rowSpacing: constants.paddingSmall
 
-                            InfoTextArea {
-                                Layout.columnSpan: 2
-                                Layout.fillWidth: true
-                                Layout.bottomMargin: constants.paddingMedium
-                                visible: channeldetails.canSend.msatsInt < 0.5 * channeldetails.localCapacity.msatsInt
-                                    && channeldetails.localCapacity.msatsInt > 0.2 * channeldetails.capacity.msatsInt
-                                iconStyle: InfoTextArea.IconStyle.Warn
-                                compact: true
-                                text: [qsTr('The amount available for sending is considerably lower than the local balance.'),
-                                    qsTr('This can occur when mempool fees are high.')].join(' ')
-                            }
-
                             ChannelBar {
                                 Layout.columnSpan: 2
                                 Layout.fillWidth: true
@@ -123,6 +111,21 @@ Pane {
                             }
 
                             Label {
+                                text: qsTr('Local balance')
+                                color: Material.accentColor
+                            }
+
+                            FormattedAmount {
+                                visible: channeldetails.isOpen
+                                amount: channeldetails.localCapacity
+                            }
+
+                            Label {
+                                visible: !channeldetails.isOpen
+                                text: qsTr('n/a (channel not open)')
+                            }
+
+                            Label {
                                 text: qsTr('Can send')
                                 color: Material.accentColor
                             }
@@ -142,14 +145,10 @@ Pane {
                                     Layout.fillWidth: true
                                     Layout.preferredHeight: 1
                                 }
-                                Pane {
-                                    background: Rectangle { color: Material.dialogColor }
-                                    padding: 0
-                                    FlatButton {
-                                        Layout.minimumWidth: implicitWidth
-                                        text: channeldetails.frozenForSending ? qsTr('Unfreeze') : qsTr('Freeze')
-                                        onClicked: channeldetails.freezeForSending()
-                                    }
+                                Button {
+                                    Layout.minimumWidth: implicitWidth
+                                    text: channeldetails.frozenForSending ? qsTr('Unfreeze') : qsTr('Freeze')
+                                    onClicked: channeldetails.freezeForSending()
                                 }
                             }
 
@@ -179,14 +178,10 @@ Pane {
                                     Layout.fillWidth: true
                                     Layout.preferredHeight: 1
                                 }
-                                Pane {
-                                    background: Rectangle { color: Material.dialogColor }
-                                    padding: 0
-                                    FlatButton {
-                                        Layout.minimumWidth: implicitWidth
-                                        text: channeldetails.frozenForReceiving ? qsTr('Unfreeze') : qsTr('Freeze')
-                                        onClicked: channeldetails.freezeForReceiving()
-                                    }
+                                Button {
+                                    Layout.minimumWidth: implicitWidth
+                                    text: channeldetails.frozenForReceiving ? qsTr('Unfreeze') : qsTr('Freeze')
+                                    onClicked: channeldetails.freezeForReceiving()
                                 }
                             }
 
@@ -253,7 +248,9 @@ Pane {
                     }
 
                     Label {
+                        Layout.fillWidth: true
                         text: channeldetails.channelType
+                        wrapMode: Text.Wrap
                     }
 
                     Label {
@@ -461,8 +458,8 @@ Pane {
                 }
             }
         }
-
     }
+    property color navigationBarBackgroundColor: constants.highlightBackground
 
     ChannelDetails {
         id: channeldetails
