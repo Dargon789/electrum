@@ -2,8 +2,11 @@ import os
 import sys
 import unittest
 import subprocess
+from typing import Mapping, Any
+
 
 class TestLightning(unittest.TestCase):
+    agents: Mapping[str, Mapping[str, Any]]
 
     @staticmethod
     def run_shell(args, timeout=30):
@@ -44,6 +47,8 @@ class TestUnixSockets(TestLightning):
 class TestLightningAB(TestLightning):
     agents = {
         'alice': {
+            'test_force_disable_mpp': 'false',
+            'test_force_mpp': 'true',
         },
         'bob': {
             'lightning_listen': 'localhost:9735',
@@ -65,14 +70,20 @@ class TestLightningAB(TestLightning):
     def test_extract_preimage(self):
         self.run_shell(['extract_preimage'])
 
-    def test_redeem_htlcs(self):
-        self.run_shell(['redeem_htlcs'])
+    def test_redeem_received_htlcs(self):
+        self.run_shell(['redeem_received_htlcs'])
+
+    def test_redeem_offered_htlcs(self):
+        self.run_shell(['redeem_offered_htlcs'])
 
     def test_breach_with_unspent_htlc(self):
         self.run_shell(['breach_with_unspent_htlc'])
 
     def test_breach_with_spent_htlc(self):
         self.run_shell(['breach_with_spent_htlc'])
+
+    def test_lnwatcher_waits_until_fees_go_down(self):
+        self.run_shell(['lnwatcher_waits_until_fees_go_down'])
 
 
 class TestLightningSwapserver(TestLightning):
@@ -84,14 +95,17 @@ class TestLightningSwapserver(TestLightning):
         },
         'bob': {
             'lightning_listen': 'localhost:9735',
-            'enable_plugin_swapserver': 'true',
-            'swapserver_port': '5455',
+            'plugins.swapserver.enabled': 'true',
+            'plugins.swapserver.port': '5455',
             'nostr_relays': "''",
         }
     }
 
-    def test_swapserver_success(self):
-        self.run_shell(['swapserver_success'])
+    def test_swapserver_success_forward(self):
+        self.run_shell(['swapserver_success_forward'])
+
+    def test_swapserver_success_reverse(self):
+        self.run_shell(['swapserver_success_reverse'])
 
     def test_swapserver_forceclose(self):
         self.run_shell(['swapserver_forceclose'])
@@ -103,17 +117,17 @@ class TestLightningSwapserver(TestLightning):
 
 class TestLightningWatchtower(TestLightning):
     agents = {
-        'alice':{
+        'alice': {
         },
-        'bob':{
+        'bob': {
             'lightning_listen': 'localhost:9735',
             'watchtower_url': 'http://wtuser:wtpassword@127.0.0.1:12345',
         },
-        'carol':{
-            'enable_plugin_watchtower': 'true',
-            'watchtower_user': 'wtuser',
-            'watchtower_password': 'wtpassword',
-            'watchtower_port': '12345',
+        'carol': {
+            'plugins.watchtower.enabled': 'true',
+            'plugins.watchtower.server_user': 'wtuser',
+            'plugins.watchtower.server_password': 'wtpassword',
+            'plugins.watchtower.server_port': '12345',
         }
     }
 
@@ -121,17 +135,33 @@ class TestLightningWatchtower(TestLightning):
         self.run_shell(['watchtower'])
 
 
-class TestLightningJIT(TestLightning):
+class TestLightningABC(TestLightning):
     agents = {
-        'alice':{
-            'accept_zeroconf_channels': 'true',
+        'alice': {
         },
-        'bob':{
+        'bob': {
             'lightning_listen': 'localhost:9735',
             'lightning_forward_payments': 'true',
-            'accept_zeroconf_channels': 'true',
         },
-        'carol':{
+        'carol': {
+        }
+    }
+
+    def test_fw_fail_htlc(self):
+        self.run_shell(['fw_fail_htlc'])
+
+
+class TestLightningJIT(TestLightning):
+    agents = {
+        'alice': {
+            'open_zeroconf_channels': 'true',
+        },
+        'bob': {
+            'lightning_listen': 'localhost:9735',
+            'lightning_forward_payments': 'true',
+            'open_zeroconf_channels': 'true',
+        },
+        'carol': {
         }
     }
 
@@ -141,17 +171,17 @@ class TestLightningJIT(TestLightning):
 
 class TestLightningJITTrampoline(TestLightningJIT):
     agents = {
-        'alice':{
+        'alice': {
             'use_gossip': 'false',
-            'accept_zeroconf_channels': 'true',
+            'open_zeroconf_channels': 'true',
         },
-        'bob':{
+        'bob': {
             'lightning_listen': 'localhost:9735',
             'lightning_forward_payments': 'true',
             'lightning_forward_trampoline_payments': 'true',
-            'accept_zeroconf_channels': 'true',
+            'open_zeroconf_channels': 'true',
         },
-        'carol':{
+        'carol': {
             'use_gossip': 'false',
         }
     }

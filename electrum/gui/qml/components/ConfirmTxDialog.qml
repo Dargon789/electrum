@@ -11,7 +11,7 @@ ElDialog {
     id: dialog
 
     required property QtObject finalizer
-    required property Amount satoshis
+    required property var satoshis  // type: Amount
     property string address
     property string message
     property bool showOptions: true
@@ -30,10 +30,17 @@ ElDialog {
     padding: 0
 
     function updateAmountText() {
-        btcValue.text = Config.formatSats(finalizer.effectiveAmount, false)
-        fiatValue.text = Daemon.fx.enabled
-            ? Daemon.fx.fiatValue(finalizer.effectiveAmount, false)
-            : ''
+        if (finalizer.valid) {
+            btcValue.text = Config.formatSats(finalizer.effectiveAmount, false)
+            fiatValue.text = Daemon.fx.enabled
+                ? Daemon.fx.fiatValue(finalizer.effectiveAmount, false)
+                : ''
+        } else {
+            btcValue.text = Config.formatSats(finalizer.amount, false)
+            fiatValue.text = Daemon.fx.enabled
+                ? Daemon.fx.fiatValue(finalizer.amount, false)
+                : ''
+        }
     }
 
     ColumnLayout {
@@ -64,7 +71,7 @@ ElDialog {
                     color: Material.accentColor
                 }
 
-                TextHighlightPane {
+                DialogHighlightPane {
                     Layout.columnSpan: 2
                     Layout.fillWidth: true
                     GridLayout {
@@ -105,6 +112,9 @@ ElDialog {
                             function onEffectiveAmountChanged() {
                                 updateAmountText()
                             }
+                            function onValidChanged() {
+                                updateAmountText()
+                            }
                         }
                     }
                 }
@@ -115,7 +125,7 @@ ElDialog {
                     color: Material.accentColor
                 }
 
-                TextHighlightPane {
+                DialogHighlightPane {
                     Layout.columnSpan: 2
                     Layout.fillWidth: true
                     height: feepicker.height
@@ -146,7 +156,7 @@ ElDialog {
                     visible: showOptions
                 }
 
-                TextHighlightPane {
+                DialogHighlightPane {
                     Layout.columnSpan: 2
                     Layout.fillWidth: true
                     visible: optionstoggle.visible && !optionstoggle.collapsed
@@ -173,12 +183,13 @@ ElDialog {
 
                         HelpButton {
                             heading: qsTr('Use multiple change addresses')
-                            helptext: qsTr('To somewhat protect your privacy, Electrum tries to create change with similar precision to other outputs.')
+                            helptext: [qsTr('In some cases, use up to 3 change addresses in order to break up large coin amounts and obfuscate the recipient address.'),
+                                       qsTr('This may result in higher transactions fees.')].join(' ')
                         }
 
                         ElCheckBox {
                             Layout.fillWidth: true
-                            text: qsTr('Enable output value rounding')
+                            text: Config.shortDescFor('WALLET_COIN_CHOOSER_OUTPUT_ROUNDING')
                             onCheckedChanged: {
                                 if (activeFocus) {
                                     Config.outputValueRounding = checked
@@ -191,9 +202,8 @@ ElDialog {
                         }
 
                         HelpButton {
-                            heading: qsTr('Enable output value rounding')
-                            helptext: qsTr('In some cases, use up to 3 change addresses in order to break up large coin amounts and obfuscate the recipient address.')
-                                    + ' ' + qsTr('This may result in higher transactions fees.')
+                            heading: Config.shortDescFor('WALLET_COIN_CHOOSER_OUTPUT_ROUNDING')
+                            helptext: Config.longDescFor('WALLET_COIN_CHOOSER_OUTPUT_ROUNDING')
                         }
 
                     }
@@ -207,12 +217,14 @@ ElDialog {
                     visible: finalizer.warning != ''
                     text: finalizer.warning
                     iconStyle: InfoTextArea.IconStyle.Warn
+                    backgroundColor: constants.darkerDialogBackground
                 }
 
                 ToggleLabel {
                     id: inputs_label
                     Layout.columnSpan: 2
                     Layout.topMargin: constants.paddingMedium
+                    visible: finalizer.valid
 
                     labelText: qsTr('Inputs (%1)').arg(finalizer.inputs.length)
                     color: Material.accentColor
@@ -225,6 +237,8 @@ ElDialog {
                     delegate: TxInput {
                         Layout.columnSpan: 2
                         Layout.fillWidth: true
+                        visible: finalizer.valid
+                        backgroundColor: constants.darkerDialogBackground
 
                         idx: index
                         model: modelData
@@ -235,6 +249,7 @@ ElDialog {
                     id: outputs_label
                     Layout.columnSpan: 2
                     Layout.topMargin: constants.paddingMedium
+                    visible: finalizer.valid
 
                     labelText: qsTr('Outputs (%1)').arg(finalizer.outputs.length)
                     color: Material.accentColor
@@ -247,6 +262,8 @@ ElDialog {
                     delegate: TxOutput {
                         Layout.columnSpan: 2
                         Layout.fillWidth: true
+                        visible: finalizer.valid
+                        backgroundColor: constants.darkerDialogBackground
 
                         allowShare: false
                         allowClickAddress: false
@@ -259,15 +276,19 @@ ElDialog {
             }
         }
 
-        FlatButton {
-            id: sendButton
+        DialogButtonContainer {
             Layout.fillWidth: true
-            text: (Daemon.currentWallet.isWatchOnly || !Daemon.currentWallet.canSignWithoutCosigner)
-                    ? qsTr('Finalize')
-                    : qsTr('Pay...')
-            icon.source: '../../icons/confirmed.png'
-            enabled: finalizer.valid
-            onClicked: doAccept()
+
+            FlatButton {
+                id: sendButton
+                Layout.fillWidth: true
+                text: (Daemon.currentWallet.isWatchOnly || !Daemon.currentWallet.canSignWithoutCosigner)
+                        ? qsTr('Finalize...')
+                        : qsTr('Pay...')
+                icon.source: '../../icons/confirmed.png'
+                enabled: finalizer.valid
+                onClicked: doAccept()
+            }
         }
     }
 

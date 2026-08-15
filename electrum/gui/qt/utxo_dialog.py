@@ -28,19 +28,16 @@ import copy
 
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QTextCharFormat, QFont
-from PyQt6.QtWidgets import QVBoxLayout, QHBoxLayout, QLabel, QTextBrowser
+from PyQt6.QtWidgets import QVBoxLayout, QHBoxLayout, QLabel
 
 from electrum.i18n import _
 
-from .util import WindowModalDialog, ButtonsLineEdit, ShowQRLineEdit, ColorScheme, Buttons, CloseButton, MONOSPACE_FONT, WWLabel
-from .history_list import HistoryList, HistoryModel
-from .qrtextedit import ShowQRTextEdit
+from .util import WindowModalDialog, ColorScheme, Buttons, CloseButton, MONOSPACE_FONT, WWLabel
 from .transaction_dialog import TxOutputColoring, QTextBrowserWithDefaultSize
 
 if TYPE_CHECKING:
     from electrum.transaction import PartialTxInput
     from .main_window import ElectrumWindow
-
 
 
 class UTXODialog(WindowModalDialog):
@@ -57,7 +54,11 @@ class UTXODialog(WindowModalDialog):
         self.parents_list.anchorClicked.connect(self.open_tx)  # send links to our handler
         self.parents_list.setFont(QFont(MONOSPACE_FONT))
         self.parents_list.setReadOnly(True)
-        self.parents_list.setTextInteractionFlags(self.parents_list.textInteractionFlags() | Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.LinksAccessibleByKeyboard)
+        self.parents_list.setTextInteractionFlags(
+            self.parents_list.textInteractionFlags() |
+            Qt.TextInteractionFlag.LinksAccessibleByMouse |
+            Qt.TextInteractionFlag.LinksAccessibleByKeyboard
+        )
         self.txo_color_parent = TxOutputColoring(
             legend=_("Direct parent"), color=ColorScheme.BLUE, tooltip=_("Direct parent"))
         self.txo_color_uncle = TxOutputColoring(
@@ -102,11 +103,12 @@ class UTXODialog(WindowModalDialog):
 
         self.parents_list.clear()
         self.num_reuse = 0
+
         def print_ascii_tree(_txid, prefix, is_last, is_uncle):
             if _txid not in parents:
                 return
             tx_mined_info = self.wallet.adb.get_tx_height(_txid)
-            tx_height = tx_mined_info.height
+            tx_height = tx_mined_info.height()
             tx_pos = tx_mined_info.txpos
             key = "%dx%d"%(tx_height, tx_pos) if tx_pos is not None else _txid[0:8]
             label = self.wallet.get_label_for_txid(_txid) or ""

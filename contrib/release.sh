@@ -6,8 +6,9 @@
 # - assumes all keys are available, and signs everything
 # This script, for other builders:
 # - builds all reproducible binaries,
-# - downloads binaries built by the release manager (from airlock), compares and signs them,
-# - and then uploads sigs
+# - downloads binaries built by the release manager (from airlock if SFTPUSER, else from website),
+#   compares and signs them,
+# - and then uploads sigs (if SFTPUSER), else they can be submitted as PR to spesmilo/electrum-signatures
 # Note: the .dmg should be built separately beforehand and copied into dist/
 #       (as it is built on a separate machine)
 #
@@ -23,7 +24,8 @@
 #     2. cd to the submodule dir, and git pull
 #     3. cd .. && git push
 # - update RELEASE-NOTES and version.py
-# - $ git tag -s $VERSION -m $VERSION
+# - $ git tag -s "$VERSION" -m "$VERSION"
+# - $ git push "$REMOTE_ORIGIN" tag "$VERSION"
 #
 # -----
 # Then, typical release flow:
@@ -57,7 +59,6 @@ if [ -z "$GPGUSER" ]; then
     fail "usage: $0 gpg_username"
 fi
 
-export SSHUSER="$GPGUSER"
 RELEASEMANAGER=""
 if [ "$GPGUSER" == "ThomasV" ]; then
     PUBKEY="--local-user 6694D8DE7BE8EE5631BED9502BD5824B7F9470E6"
@@ -68,6 +69,8 @@ elif [ "$GPGUSER" == "sombernight_releasekey" ]; then
     export SSHUSER=sombernight
 else
     warn "unexpected GPGUSER=$GPGUSER"
+    PUBKEY=""
+    export SSHUSER=""
 fi
 
 
@@ -161,7 +164,12 @@ do
         if [ ! -z "$RELEASEMANAGER" ] ; then
             ./contrib/android/build.sh qml $arch release $password
         else
-            ./contrib/android/build.sh qml $arch release-unsigned
+            if test -f "dist/$apk_unsigned"; then
+                # has already been built separately before
+                info "found unsigned: $apk_unsigned"
+            else
+                ./contrib/android/build.sh qml $arch release-unsigned
+            fi
             mv "dist/$apk_unsigned" "dist/$apk"
         fi
     fi
@@ -208,13 +216,41 @@ if [ -z "$RELEASEMANAGER" ] ; then
     rm -rf "$PROJECT_ROOT/dist/releasemanager"
     mkdir --parent "$PROJECT_ROOT/dist/releasemanager"
     cd "$PROJECT_ROOT/dist/releasemanager"
-    # TODO check somehow that RM had finished uploading
-    sftp -oBatchMode=no -b - "$SSHUSER@uploadserver" << !
-       cd electrum-downloads-airlock
-       cd "$VERSION"
-       mget *
-       bye
-!
+
+    if [ -z "$SSHUSER" ]; then
+        info "No SFTP access, downloading binaries from website"
+        BASE_URL="https://download.electrum.org/$VERSION"
+        FILES_TO_DOWNLOAD=(
+            "$tarball"
+            "$srctarball"
+            "$appimage"
+            "$win1"
+            "$win2"
+            "$win3"
+            "$apk1"
+            "$apk2"
+            "$apk3"
+            "$dmg"
+        )
+
+        for filename in "${FILES_TO_DOWNLOAD[@]}"; do
+            if [ ! -f "$filename" ]; then
+                info "Downloading $filename..."
+                wget -q "$BASE_URL/$filename" -O "$filename" || fail "Failed to download $filename"
+            else
+                info "File already exists: $filename"
+            fi
+        done
+    else
+        # TODO check somehow that RM had finished uploading
+        sftp -oBatchMode=no -b - "$SSHUSER@uploadserver" <<-EOF
+           cd electrum-downloads-airlock
+           cd "$VERSION"
+           mget *
+           bye
+EOF
+    fi
+
     # check we have each binary
     test -f "$tarball"    || fail "tarball not found among sftp downloads"
     test -f "$srctarball" || fail "srctarball not found among sftp downloads"
@@ -254,8 +290,14 @@ if [ -z "$RELEASEMANAGER" ] ; then
         signame="$fname.$GPGUSER.asc"
         gpg --sign --armor --detach $PUBKEY --output "$PROJECT_ROOT/dist/sigs/$signame" "$fname"
     done
-    # upload sigs
-    ELECBUILD_UPLOADFROM="$PROJECT_ROOT/dist/sigs/" "$CONTRIB/upload.sh"
+
+    if [ -z "$SSHUSER" ]; then
+        info "Signing successfully, now open a pull request with your signatures to spesmilo/electrum-signatures"
+        exit 0
+    else
+        # upload sigs
+        ELECBUILD_UPLOADFROM="$PROJECT_ROOT/dist/sigs/" "$CONTRIB/upload.sh"
+    fi
 
 else
     # ONLY release manager
@@ -274,7 +316,7 @@ else
     test -f "$PROJECT_ROOT/dist/$apk3"       || fail "apk3 not found among built files"
     test -f "$PROJECT_ROOT/dist/$dmg"        || fail "dmg not found among built files"
 
-    if [ $REV != $VERSION ]; then
+    if [ "$REV" != "$VERSION" ]; then
         fail "versions differ, not uploading"
     fi
 
@@ -283,6 +325,7 @@ else
 
 fi
 
+set +x
 
 info "release.sh finished successfully."
 info "After two people ran release.sh, the binaries will be publicly available on uploadserver."

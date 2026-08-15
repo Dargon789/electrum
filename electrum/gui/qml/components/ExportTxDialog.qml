@@ -13,6 +13,7 @@ ElDialog {
     // if text_qr is undefined text will be used
     property string text_help
     property string text_warn
+    property string tx_label
 
     title: qsTr('Share Transaction')
 
@@ -38,7 +39,7 @@ ElDialog {
                 width: parent.width
                 spacing: constants.paddingMedium
 
-                TextHighlightPane {
+                DialogHighlightPane {
                     Layout.fillWidth: true
                     Layout.leftMargin: constants.paddingMedium
                     Layout.rightMargin: constants.paddingMedium
@@ -60,6 +61,7 @@ ElDialog {
                     Layout.margins: constants.paddingLarge
                     visible: dialog.text_help
                     text: dialog.text_help
+                    backgroundColor: constants.darkerDialogBackground
                 }
 
                 InfoTextArea {
@@ -71,11 +73,13 @@ ElDialog {
                     visible: dialog.text_warn
                     text: dialog.text_warn
                     iconStyle: InfoTextArea.IconStyle.Warn
+                    backgroundColor: constants.darkerDialogBackground
                 }
             }
         }
 
-        ButtonContainer {
+        DialogButtonContainer {
+            id: buttons
             Layout.fillWidth: true
 
             FlatButton {
@@ -95,6 +99,17 @@ ElDialog {
                 icon.source: '../../icons/share.png'
                 onClicked: {
                     AppController.doShare(dialog.text, dialog.title)
+                }
+            }
+            function beforeLayout() {
+                var export_tx_buttons = app.pluginsComponentsByName('export_tx_button')
+                for (var i=0; i < export_tx_buttons.length; i++) {
+                    var b = export_tx_buttons[i].createObject(buttons, {
+                        dialog: dialog
+                    })
+                    b.Layout.fillWidth = true
+                    b.Layout.preferredWidth = 1
+                    buttons.addItem(b)
                 }
             }
         }

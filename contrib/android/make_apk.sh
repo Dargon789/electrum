@@ -6,7 +6,6 @@ CONTRIB_ANDROID="$(dirname "$(readlink -e "$0")")"
 CONTRIB="$CONTRIB_ANDROID"/..
 PROJECT_ROOT="$CONTRIB"/..
 PACKAGES="$PROJECT_ROOT"/packages/
-LOCALE="$PROJECT_ROOT"/electrum/locale/
 
 . "$CONTRIB"/build_tools_util.sh
 
@@ -20,17 +19,12 @@ if [ ! -d "$PACKAGES" ]; then
     "$CONTRIB"/make_packages.sh || fail "make_packages failed"
 fi
 
-pushd "$PROJECT_ROOT"
-git submodule update --init
-popd
-
 # update locale
 info "preparing electrum-locale."
 (
-    LOCALE="$PROJECT_ROOT/electrum/locale/"
+    "$CONTRIB/locale/build_cleanlocale.sh"
     # we want the binary to have only compiled (.mo) locale files; not source (.po) files
-    rm -rf "$LOCALE"
-    "$CONTRIB/build_locale.sh" "$CONTRIB/deterministic-build/electrum-locale/locale/" "$LOCALE"
+    rm -r "$PROJECT_ROOT/electrum/locale/locale"/*/electrum.po
 )
 
 pushd "$CONTRIB_ANDROID"
@@ -40,12 +34,21 @@ info "apk building phase starts."
 # Uncomment and change below to set a custom android package id,
 # e.g. to allow simultaneous mainnet and testnet installs of the apk.
 # defaults:
+#
 #   export APP_PACKAGE_NAME=Electrum
 #   export APP_PACKAGE_DOMAIN=org.electrum
-# FIXME: changing "APP_PACKAGE_NAME" seems to require a clean rebuild of ".buildozer/",
-#        to avoid that, maybe change "APP_PACKAGE_DOMAIN" instead.
-# So, in particular, to build a testnet apk, simply uncomment:
+#
+# FIXME: changing "APP_PACKAGE_NAME" seems to require a clean rebuild of ".buildozer/".
+#        However, even with a clean build, the build appears to break in the final stages (~4.7.0).
+#        To avoid these issues; only change "APP_PACKAGE_DOMAIN" instead.
+#
+# So, in particular, to build testnet APKs, simply uncomment one of the following at a time (per-build):
+#
+# Testnet3
 #export APP_PACKAGE_DOMAIN=org.electrum.testnet
+#
+# Testnet4
+#export APP_PACKAGE_DOMAIN=org.electrum.testnet4
 
 if [ $CI ]; then
     # override log level specified in buildozer.spec to "debug":
@@ -92,16 +95,22 @@ if [[ "$2" == "all" ]] ; then
     # FIXME failures are not propagated out: we should fail the script if any arch build fails
     export APP_ANDROID_ARCHS=armeabi-v7a
     export APP_ANDROID_NUMERIC_VERSION=$("$CONTRIB_ANDROID"/get_apk_versioncode.py "$APP_ANDROID_ARCHS")
+    "$CONTRIB_ANDROID"/make_barcode_scanner.sh "$APP_ANDROID_ARCHS" || fail "make_barcode_scanner.sh failed"
     make $TARGET
+
     export APP_ANDROID_ARCHS=arm64-v8a
     export APP_ANDROID_NUMERIC_VERSION=$("$CONTRIB_ANDROID"/get_apk_versioncode.py "$APP_ANDROID_ARCHS")
+    "$CONTRIB_ANDROID"/make_barcode_scanner.sh "$APP_ANDROID_ARCHS" || fail "make_barcode_scanner.sh failed"
     make $TARGET
+
     export APP_ANDROID_ARCHS=x86_64
     export APP_ANDROID_NUMERIC_VERSION=$("$CONTRIB_ANDROID"/get_apk_versioncode.py "$APP_ANDROID_ARCHS")
+    "$CONTRIB_ANDROID"/make_barcode_scanner.sh "$APP_ANDROID_ARCHS" || fail "make_barcode_scanner.sh failed"
     make $TARGET
 else
     export APP_ANDROID_ARCHS=$2
     export APP_ANDROID_NUMERIC_VERSION=$("$CONTRIB_ANDROID"/get_apk_versioncode.py "$APP_ANDROID_ARCHS")
+    "$CONTRIB_ANDROID"/make_barcode_scanner.sh "$APP_ANDROID_ARCHS" || fail "make_barcode_scanner.sh failed"
     make $TARGET
 fi
 

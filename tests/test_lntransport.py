@@ -1,8 +1,10 @@
 import asyncio
+from typing import List
 
 import electrum_ecc as ecc
 
 from electrum import util
+from electrum import lntransport
 from electrum.lntransport import LNPeerAddr, LNResponderTransport, LNTransport, extract_nodeid, split_host_port, ConnStringFormatError
 from electrum.util import OldTaskGroup
 
@@ -71,6 +73,7 @@ class TestLNTransport(ElectrumTestCase):
 
         async def cb(reader, writer):
             t = LNResponderTransport(responder_key.get_secret_bytes(), reader, writer)
+            transports.append(t)
             self.assertEqual(await t.handshake(), initiator_key.get_public_key_bytes())
             async with OldTaskGroup() as group:
                 await group.spawn(read_messages(t, messages_sent_by_client))
@@ -79,12 +82,14 @@ class TestLNTransport(ElectrumTestCase):
         async def connect(port: int):
             peer_addr = LNPeerAddr('127.0.0.1', port, responder_key.get_public_key_bytes())
             t = LNTransport(initiator_key.get_secret_bytes(), peer_addr, e_proxy=None)
+            transports.append(t)
             await t.handshake()
             async with OldTaskGroup() as group:
                 await group.spawn(read_messages(t, messages_sent_by_server))
                 await group.spawn(write_messages(t, messages_sent_by_client))
             server_shaked.set()
 
+        transports = []  # type: List[lntransport.LNTransportBase]
         async def f():
             server = await asyncio.start_server(cb, '127.0.0.1', port=None)
             server_port = server.sockets[0].getsockname()[1]
@@ -94,7 +99,10 @@ class TestLNTransport(ElectrumTestCase):
                     await group.spawn(responder_shaked.wait())
                     await group.spawn(server_shaked.wait())
             finally:
+                for t in transports:
+                    t.close()
                 server.close()
+                await server.wait_closed()
 
         await f()
 
@@ -133,3 +141,35 @@ class TestLNTransport(ElectrumTestCase):
         self.assertEqual(extract_nodeid(f"{pubkey1.hex()}@[2001:41d0:e:734::1]:8888"), (pubkey1, "[2001:41d0:e:734::1]:8888"))
         # just pubkey
         self.assertEqual(extract_nodeid(f"{pubkey1.hex()}"), (pubkey1, None))
+
+
+class TestLNPeerAddr(ElectrumTestCase):
+
+    def test_validate_net_address(self):
+        # Test invalid host
+        with self.assertRaises(ValueError):
+            LNPeerAddr("", 9735, b'\x00'*33)
+        with self.assertRaises(ValueError):
+            LNPeerAddr("999.999.999.999", 9735, b'\x00'*33)
+        # Test invalid port
+        with self.assertRaises(ValueError):
+            LNPeerAddr("127.0.0.1", -1, b'\x00'*33)
+        with self.assertRaises(ValueError):
+            LNPeerAddr("127.0.0.1", 70000, b'\x00'*33)
+
+    def test_is_onion(self):
+        # Test onion addresses
+        addr1 = LNPeerAddr("example.onion", 9735, b'\x00'*33)
+        self.assertTrue(addr1.is_onion())
+        addr2 = LNPeerAddr("subdomain.example.onion", 9735, b'\x00'*33)
+        self.assertTrue(addr2.is_onion())
+
+        # Test non-onion
+        addr3 = LNPeerAddr("example.com", 9735, b'\x00'*33)
+        self.assertFalse(addr3.is_onion())
+        addr4 = LNPeerAddr("127.0.0.1", 9735, b'\x00'*33)
+        self.assertFalse(addr4.is_onion())
+        addr5 = LNPeerAddr("::1", 9735, b'\x00'*33)
+        self.assertFalse(addr5.is_onion())
+        addr6 = LNPeerAddr("onion", 9735, b'\x00'*33)
+        self.assertFalse(addr6.is_onion())

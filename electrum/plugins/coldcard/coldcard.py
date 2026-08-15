@@ -17,8 +17,8 @@ from electrum.wallet import Standard_Wallet, Multisig_Wallet, Abstract_Wallet
 from electrum.util import bfh, versiontuple, UserFacingException
 from electrum.logging import get_logger
 
-from ..hw_wallet import HW_PluginBase, HardwareClientBase
-from ..hw_wallet.plugin import LibraryFoundButUnusable, only_hook_if_libraries_available
+from electrum.hw_wallet import HW_PluginBase, HardwareClientBase
+from electrum.hw_wallet.plugin import LibraryFoundButUnusable, only_hook_if_libraries_available
 
 if TYPE_CHECKING:
     from electrum.plugin import DeviceInfo
@@ -34,7 +34,12 @@ try:
     from ckcc.constants import (MAX_MSG_LEN, MAX_BLK_LEN, MSG_SIGNING_MAX_LENGTH, MAX_TXN_LEN,
         AF_CLASSIC, AF_P2SH, AF_P2WPKH, AF_P2WSH, AF_P2WPKH_P2SH, AF_P2WSH_P2SH)
 
-    from ckcc.client import ColdcardDevice, COINKITE_VID, CKCC_PID, CKCC_SIMULATOR_PATH
+    from ckcc.client import ColdcardDevice, COINKITE_VID, CKCC_PID
+
+    try:  # >= v1.5.0
+        from ckcc.client import DEFAULT_SIM_SOCKET as CKCC_SIMULATOR_PATH
+    except ImportError:  # <= v1.4.x
+        from ckcc.client import CKCC_SIMULATOR_PATH
 
     requirements_ok = True
 
@@ -72,7 +77,11 @@ class CKCCClient(HardwareClientBase):
         else:
             # open the real HID device
             hd = hid.device(path=dev_path)
-            hd.open_path(dev_path)
+            try:
+                hd.open_path(dev_path)
+            except OSError:
+                _logger.error('cannot open hid path. Did you forget to configure udev rules?')
+                raise
 
             self.dev = ElectrumColdcardDevice(dev=hd, encrypt=True)
 
@@ -84,7 +93,7 @@ class CKCCClient(HardwareClientBase):
 
     def get_soft_device_id(self) -> Optional[str]:
         try:
-            super().get_soft_device_id()
+            return super().get_soft_device_id()
         except CCProtoError:
             return None
 
@@ -212,9 +221,9 @@ class CKCCClient(HardwareClientBase):
         return self.dev.send_recv(CCProtocolPacker.version(), timeout=1000).split('\n')
 
     @runs_in_hwd_thread
-    def sign_message_start(self, path, msg):
+    def sign_message_start(self, path, msg, addr_fmt):
         # this starts the UX experience.
-        self.dev.send_recv(CCProtocolPacker.sign_message(msg, path), timeout=None)
+        self.dev.send_recv(CCProtocolPacker.sign_message(msg, path, addr_fmt), timeout=None)
 
     @runs_in_hwd_thread
     def sign_message_poll(self):
@@ -292,10 +301,10 @@ class Coldcard_KeyStore(Hardware_KeyStore):
 
         return client
 
-    def give_error(self, message):
+    def give_error(self, message: str | BaseException):
         self.logger.info(message)
         if not self.ux_busy:
-            self.handler.show_error(message)
+            self.handler.show_error(str(message))
         else:
             self.ux_busy = False
         raise UserFacingException(message)
@@ -328,12 +337,18 @@ class Coldcard_KeyStore(Hardware_KeyStore):
             return b''
 
         path = self.get_derivation_prefix() + ("/%d/%d" % sequence)
+
+        if script_type:
+            addr_fmt = self._encode_txin_type(script_type)
+        else:
+            addr_fmt = AF_CLASSIC
+
         try:
             cl = self.get_client()
             try:
                 self.handler.show_message("Signing message (using %s)..." % path)
 
-                cl.sign_message_start(path, msg)
+                cl.sign_message_start(path, msg, addr_fmt)
 
                 while 1:
                     # How to kill some time, without locking UI?
@@ -445,7 +460,7 @@ class Coldcard_KeyStore(Hardware_KeyStore):
                 _('Error showing address') + ':', str(exc)))
         except BaseException as exc:
             self.logger.exception('')
-            self.handler.show_error(exc)
+            self.handler.show_error(str(exc))
 
     @wrap_busy
     def show_p2sh_address(self, M, script, xfp_paths, txin_type):
@@ -467,7 +482,7 @@ class Coldcard_KeyStore(Hardware_KeyStore):
                 str(exc)))
         except BaseException as exc:
             self.logger.exception('')
-            self.handler.show_error(exc)
+            self.handler.show_error(str(exc))
 
 
 class ColdcardPlugin(HW_PluginBase):

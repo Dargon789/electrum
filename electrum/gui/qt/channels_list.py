@@ -6,22 +6,17 @@ from abc import abstractmethod, ABC
 
 from PyQt6 import QtCore, QtGui
 from PyQt6.QtCore import Qt, QRect, QSize
-from PyQt6.QtWidgets import (QMenu, QHBoxLayout, QLabel, QVBoxLayout, QGridLayout, QLineEdit,
-                             QPushButton, QAbstractItemView, QComboBox, QCheckBox,
-                             QToolTip)
+from PyQt6.QtWidgets import QMenu, QLabel, QVBoxLayout, QGridLayout, QAbstractItemView, QCheckBox, QToolTip
 from PyQt6.QtGui import QFont, QStandardItem, QBrush, QPainter, QIcon, QHelpEvent
 
-from electrum.util import NotEnoughFunds, NoDynamicFeeEstimates
 from electrum.i18n import _
-from electrum.lnchannel import AbstractChannel, PeerState, ChannelBackup, Channel, ChannelState, ChanCloseOption
+from electrum.lnchannel import AbstractChannel, ChannelBackup, Channel, ChanCloseOption
 from electrum.wallet import Abstract_Wallet
-from electrum.lnutil import LOCAL, REMOTE, format_short_channel_id
+from electrum.lnutil import LOCAL, REMOTE
 from electrum.lnworker import LNWallet
 from electrum.gui import messages
 
-from .util import (WindowModalDialog, Buttons, OkButton, CancelButton,
-                   EnterButton, WaitingDialog, MONOSPACE_FONT, ColorScheme)
-from .amountedit import BTCAmountEdit, FreezableLineEdit
+from .util import WindowModalDialog, Buttons, OkButton, EnterButton, WaitingDialog, MONOSPACE_FONT, ColorScheme
 from .util import read_QIcon, font_height
 from .my_treeview import MyTreeView
 
@@ -103,7 +98,7 @@ class ChannelsList(MyTreeView):
             labels[subject] = label
         status = chan.get_state_for_GUI()
         closed = chan.is_closed()
-        node_alias = self.lnworker.get_node_alias(chan.node_id) or chan.node_id.hex()
+        node_alias = self.lnworker.lnpeermgr.get_node_alias(chan.node_id) or chan.node_id.hex()
         capacity_str = self.main_window.format_amount(chan.get_capacity(), whitespaces=True)
         return {
             self.Columns.SHORT_CHANID: chan.short_id_for_GUI(),
@@ -117,7 +112,7 @@ class ChannelsList(MyTreeView):
         }
 
     def on_channel_closed(self, txid):
-        self.main_window.show_error('Channel closed' + '\n' + txid)
+        self.main_window.show_message('Channel closed' + '\n' + txid)
 
     def on_failure(self, exc_info):
         type_, e, tb = exc_info
@@ -132,15 +127,19 @@ class ChannelsList(MyTreeView):
             return
         coro = self.lnworker.close_channel(channel_id)
         on_success = self.on_channel_closed
+
         def task():
             return self.network.run_from_another_thread(coro)
+
         WaitingDialog(self, _('Please wait...'), task, on_success, self.on_failure)
 
     def force_close(self, channel_id):
         self.save_backup = True
         backup_cb = QCheckBox('Create a backup now', checked=True)
+
         def on_checked(_x):
             self.save_backup = backup_cb.isChecked()
+
         backup_cb.stateChanged.connect(on_checked)
         chan = self.lnworker.channels[channel_id]
         to_self_delay = chan.config[REMOTE].to_self_delay
@@ -155,9 +154,11 @@ class ChannelsList(MyTreeView):
         if self.save_backup:
             if not self.main_window.backup_wallet():
                 return
+
         def task():
             coro = self.lnworker.force_close_channel(channel_id)
             return self.network.run_from_another_thread(coro)
+
         WaitingDialog(self, _('Please wait...'), task, self.on_channel_closed, self.on_failure)
 
     def remove_channel(self, channel_id):
@@ -169,13 +170,7 @@ class ChannelsList(MyTreeView):
             self.lnworker.remove_channel_backup(channel_id)
 
     def export_channel_backup(self, channel_id):
-        msg = ' '.join([
-            _("Channel backups can be imported in another instance of the same wallet."),
-            _("In the Electrum mobile app, use the 'Send' button to scan this QR code."),
-            '\n\n',
-            _("Please note that channel backups cannot be used to restore your channels."),
-            _("If you lose your wallet file, the only thing you can do with a backup is to request your channel to be closed, so that your funds will be sent on-chain."),
-        ])
+        msg = messages.MSG_LN_EXPLAIN_SCB_BACKUPS
         data = self.lnworker.export_channel_backup(channel_id)
         self.main_window.show_qrcode(data, 'channel backup', help_text=msg,
                                      show_copy_text_btn=True)
@@ -185,11 +180,14 @@ class ChannelsList(MyTreeView):
         msg += '\n\n' + messages.MSG_REQUEST_FORCE_CLOSE
         if not self.main_window.question(msg):
             return
+
         def task():
             coro = self.lnworker.request_force_close(channel_id)
             return self.network.run_from_another_thread(coro)
+
         def on_done(b):
             self.main_window.show_message(_('Request scheduled'))
+
         WaitingDialog(self, _('Please wait...'), task, on_done, self.on_failure)
 
     def set_frozen(self, chan, *, for_sending, value):
@@ -209,8 +207,8 @@ class ChannelsList(MyTreeView):
             idx2 = selected[1]
             channel_id1 = idx1.sibling(idx1.row(), self.Columns.NODE_ALIAS).data(ROLE_CHANNEL_ID)
             channel_id2 = idx2.sibling(idx2.row(), self.Columns.NODE_ALIAS).data(ROLE_CHANNEL_ID)
-            chan1 = self.lnworker.channels.get(channel_id1)
-            chan2 = self.lnworker.channels.get(channel_id2)
+            chan1 = self.lnworker.get_channel_by_id(channel_id1)
+            chan2 = self.lnworker.get_channel_by_id(channel_id2)
             if chan1 and chan2 and (not self.lnworker.uses_trampoline() or chan1.node_id != chan2.node_id):
                 return chan1, chan2
         return None, None
@@ -283,7 +281,7 @@ class ChannelsList(MyTreeView):
                 menu.addAction(_("Delete"), lambda: self.remove_channel_backup(channel_id))
             else:
                 menu.addAction(_("Delete"), lambda: self.remove_channel(channel_id))
-        menu.exec(self.viewport().mapToGlobal(position))
+        self.open_menu(menu, position)
 
     @QtCore.pyqtSlot(Abstract_Wallet, AbstractChannel)
     def do_update_single_row(self, wallet: Abstract_Wallet, chan: AbstractChannel):
@@ -370,7 +368,11 @@ class ChannelsList(MyTreeView):
         #     and maybe add item "main_window.init_lightning_dialog()" when applicable
         menu.setEnabled(self.wallet.has_lightning())
         self.new_channel_button = EnterButton(_('New Channel'), self.main_window.new_channel_dialog)
-        self.new_channel_button.setEnabled(self.wallet.has_lightning())
+        if not self.wallet.can_have_lightning():
+            self.new_channel_button.setEnabled(False)
+            self.new_channel_button.setToolTip(_("Lightning is not available for this wallet."))
+        else:
+            self.new_channel_button.setToolTip(_("Open a channel to send payments over the Lightning network."))
         toolbar.insertWidget(2, self.new_channel_button)
         return toolbar
 
@@ -438,12 +440,6 @@ class ChanFeatNoOnchainBackup(ChannelFeature):
         return read_QIcon("cloud_no")
 
 
-class ChanFeatAnchors(ChannelFeature):
-    def tooltip(self) -> str:
-        return _("This channel uses anchor outputs.")
-    def icon(self) -> QIcon:
-        return read_QIcon("anchor")
-
 
 class ChannelFeatureIcons:
 
@@ -465,8 +461,6 @@ class ChannelFeatureIcons:
                 feats.append(ChanFeatTrampoline())
             if not chan.has_onchain_backup():
                 feats.append(ChanFeatNoOnchainBackup())
-            if chan.has_anchors():
-                feats.append(ChanFeatAnchors())
         return ChannelFeatureIcons(feats)
 
     def paint(self, painter: QPainter, rect: QRect) -> None:

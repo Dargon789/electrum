@@ -1,4 +1,4 @@
-from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject
+from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, QVariant
 
 from electrum.logging import get_logger
 from electrum.util import bfh, format_time
@@ -27,12 +27,13 @@ class QELnPaymentDetails(QObject):
         self._preimage = ''
 
     walletChanged = pyqtSignal()
-    @pyqtProperty(QEWallet, notify=walletChanged)
-    def wallet(self):
+    @pyqtProperty(QVariant, notify=walletChanged)
+    def wallet(self) -> QEWallet:
         return self._wallet
 
     @wallet.setter
     def wallet(self, wallet: QEWallet):
+        assert wallet is None or isinstance(wallet, QEWallet)
         if self._wallet != wallet:
             self._wallet = wallet
             self.walletChanged.emit()
@@ -96,16 +97,16 @@ class QELnPaymentDetails(QObject):
             return
 
         # TODO this is horribly inefficient. need a payment getter/query method
-        tx = self._wallet.wallet.lnworker.get_lightning_history()[bfh(self._key)]
+        tx = self._wallet.wallet.lnworker.get_lightning_history()[self._key]
         self._logger.debug(str(tx))
 
-        self._fee.msatsInt = 0 if not tx['fee_msat'] else int(tx['fee_msat'])
-        self._amount.msatsInt = int(tx['amount_msat'])
-        self._label = tx['label']
-        self._date = format_time(tx['timestamp'])
-        self._timestamp = tx['timestamp']
+        self._fee.msatsInt = 0 if not tx.fee_msat else int(tx.fee_msat)
+        self._amount.msatsInt = int(tx.amount_msat)
+        self._label = tx.label
+        self._date = format_time(tx.timestamp)
+        self._timestamp = tx.timestamp
         self._status = 'settled'  # TODO: other states? get_lightning_history is deciding the filter for us :(
-        self._phash = tx['payment_hash']
-        self._preimage = tx['preimage']
+        self._phash = tx.payment_hash
+        self._preimage = tx.preimage
 
         self.detailsChanged.emit()

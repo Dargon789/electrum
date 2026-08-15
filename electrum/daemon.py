@@ -30,26 +30,25 @@ import time
 import traceback
 import sys
 import threading
-from typing import Dict, Optional, Tuple, Iterable, Callable, Union, Sequence, Mapping, TYPE_CHECKING
+from typing import Dict, Optional, Tuple, Callable, Union, Sequence, Mapping, TYPE_CHECKING
 from base64 import b64decode, b64encode
-from collections import defaultdict
 import json
 import socket
-from enum import IntEnum
+import stat
 
 import aiohttp
 from aiohttp import web, client_exceptions
-from aiorpcx import timeout_after, TaskTimeout, ignore_after
+from aiorpcx import ignore_after
 
 from . import util
 from .network import Network
-from .util import (json_decode, to_bytes, to_string, profiler, standardize_path, constant_time_compare, InvalidPassword)
-from .invoices import PR_PAID, PR_EXPIRED
-from .util import log_exceptions, ignore_exceptions, randrange, OldTaskGroup, UserFacingException, JsonRPCError
-from .util import EventListener, event_listener, traceback_format_exception
+from .util import (
+    json_decode, to_bytes, to_string, profiler, standardize_path, constant_time_compare, InvalidPassword,
+    log_exceptions, randrange, OldTaskGroup, UserFacingException, JsonRPCError, os_chmod
+)
 from .wallet import Wallet, Abstract_Wallet
 from .storage import WalletStorage
-from .wallet_db import WalletDB, WalletRequiresSplit, WalletRequiresUpgrade, WalletUnfinished
+from .wallet_db import WalletDB, WalletUnfinished
 from .commands import known_commands, Commands
 from .simple_config import SimpleConfig
 from .exchange_rate import FxThread
@@ -67,8 +66,10 @@ _logger = get_logger(__name__)
 class DaemonNotRunning(Exception):
     pass
 
+
 def get_rpcsock_defaultpath(config: SimpleConfig):
     return os.path.join(config.path, 'daemon_rpc_socket')
+
 
 def get_rpcsock_default_type(config: SimpleConfig):
     if config.RPC_PORT:
@@ -80,8 +81,10 @@ def get_rpcsock_default_type(config: SimpleConfig):
         return 'unix'
     return 'tcp'
 
+
 def get_lockfile(config: SimpleConfig):
     return os.path.join(config.path, 'daemon')
+
 
 def remove_lockfile(lockfile):
     os.unlink(lockfile)
@@ -107,15 +110,15 @@ def get_file_descriptor(config: SimpleConfig):
             remove_lockfile(lockfile)
 
 
-
 def request(config: SimpleConfig, endpoint, args=(), timeout: Union[float, int] = 60):
     lockfile = get_lockfile(config)
-    while True:
-        create_time = None
+    for attempt in range(5):
+        create_time = None  # type: Optional[float | int]
         path = None
         try:
             with open(lockfile) as f:
                 socktype, address, create_time = ast.literal_eval(f.read())
+                int(create_time)  # raise if not numeric
                 if socktype == 'unix':
                     path = address
                     (host, port) = "127.0.0.1", 0
@@ -130,6 +133,7 @@ def request(config: SimpleConfig, endpoint, args=(), timeout: Union[float, int] 
         server_url = 'http://%s:%d' % (host, port)
         auth = aiohttp.BasicAuth(login=rpc_user, password=rpc_password)
         loop = util.get_asyncio_loop()
+
         async def request_coroutine(
             *, socktype=socktype, path=path, auth=auth, server_url=server_url, endpoint=endpoint,
         ):
@@ -142,15 +146,23 @@ def request(config: SimpleConfig, endpoint, args=(), timeout: Union[float, int] 
             async with aiohttp.ClientSession(auth=auth, connector=connector) as session:
                 c = util.JsonRPCClient(session, server_url)
                 return await c.request(endpoint, *args)
+
         try:
             fut = asyncio.run_coroutine_threadsafe(request_coroutine(), loop)
             return fut.result(timeout=timeout)
         except aiohttp.client_exceptions.ClientConnectorError as e:
             _logger.info(f"failed to connect to JSON-RPC server {e}")
-            if not create_time or create_time < time.time() - 1.0:
+            # We cannot communicate with the daemon.
+            # If daemon's creation time is very recent, it might still be starting up.
+            # In any other case, we raise: - too old create_time means daemon is likely dead,
+            #                              - create_time in future means our clock cannot be trusted.
+            if not (create_time <= time.time() <= create_time + 1.0):
                 raise DaemonNotRunning()
-        # Sleep a bit and try again; it might have just been started
+        # Sleep a bit and try again; daemon might have just been started
         time.sleep(1.0)
+    # how did we even get here?! the clock must be going haywire.
+    _logger.error(f"Failed to connect to JSON-RPC server. Exhausted all attempts.")
+    raise DaemonNotRunning()
 
 
 def wait_until_daemon_becomes_ready(*, config: SimpleConfig, timeout=5) -> bool:
@@ -169,6 +181,7 @@ def wait_until_daemon_becomes_ready(*, config: SimpleConfig, timeout=5) -> bool:
 def get_rpc_credentials(config: SimpleConfig) -> Tuple[str, str]:
     rpc_user = config.RPC_USERNAME or None
     rpc_password = config.RPC_PASSWORD or None
+    # note: we explicitly forbid empty/unset password, and will generate one now instead
     if rpc_user is None or rpc_password is None:
         rpc_user = 'user'
         bits = 128
@@ -185,11 +198,14 @@ def get_rpc_credentials(config: SimpleConfig) -> Tuple[str, str]:
 class AuthenticationError(Exception):
     pass
 
+
 class AuthenticationInvalidOrMissing(AuthenticationError):
     pass
 
+
 class AuthenticationCredentialsInvalid(AuthenticationError):
     pass
+
 
 class AuthenticatedServer(Logger):
 
@@ -200,14 +216,13 @@ class AuthenticatedServer(Logger):
         self.auth_lock = asyncio.Lock()
         self._methods = {}  # type: Dict[str, Callable]
 
-    def register_method(self, f):
-        assert f.__name__ not in self._methods, f"name collision for {f.__name__}"
-        self._methods[f.__name__] = f
+    def register_method(self, name: str, f):
+        assert name not in self._methods, f"name collision for {name}"
+        self._methods[name] = f
 
     async def authenticate(self, headers):
-        if self.rpc_password == '':
-            # RPC authentication is disabled
-            return
+        if not self.rpc_password:
+            raise Exception('Server RPC password is unset. This should not happen.')
         auth_string = headers.get('Authorization', None)
         if auth_string is None:
             raise AuthenticationInvalidOrMissing('CredentialsMissing')
@@ -215,7 +230,7 @@ class AuthenticatedServer(Logger):
         if basic != 'Basic':
             raise AuthenticationInvalidOrMissing('UnsupportedType')
         encoded = to_bytes(encoded, 'utf8')
-        credentials = to_string(b64decode(encoded), 'utf8')
+        credentials = to_string(b64decode(encoded, validate=True), 'utf8')
         username, _, password = credentials.partition(':')
         if not (constant_time_compare(username, self.rpc_user)
                 and constant_time_compare(password, self.rpc_password)):
@@ -264,7 +279,7 @@ class AuthenticatedServer(Logger):
                 'message': "internal error while executing RPC",
                 'data': {
                     "exception": repr(e),
-                    "traceback": "".join(traceback_format_exception(e)),
+                    "traceback": "".join(traceback.format_exception(e)),
                 },
             }
         return web.json_response(response)
@@ -272,25 +287,31 @@ class AuthenticatedServer(Logger):
 
 class CommandsServer(AuthenticatedServer):
 
-    def __init__(self, daemon: 'Daemon', fd):
+    def __init__(self, daemon: 'Daemon', fd, *, only_minimal_jsonrpc: bool):
         rpc_user, rpc_password = get_rpc_credentials(daemon.config)
         AuthenticatedServer.__init__(self, rpc_user, rpc_password)
         self.daemon = daemon
         self.fd = fd
+        self._only_minimal_jsonrpc = only_minimal_jsonrpc
         self.config = daemon.config
         sockettype = self.config.RPC_SOCKET_TYPE
         self.socktype = sockettype if sockettype != 'auto' else get_rpcsock_default_type(self.config)
         self.sockpath = self.config.RPC_SOCKET_FILEPATH or get_rpcsock_defaultpath(self.config)
         self.host = self.config.RPC_HOST
         self.port = self.config.RPC_PORT
+        self.cmd_runner = Commands(config=self.config, network=self.daemon.network, daemon=self.daemon)
         self.app = web.Application()
         self.app.router.add_post("/", self.handle)
-        self.register_method(self.ping)
-        self.register_method(self.gui)
-        self.cmd_runner = Commands(config=self.config, network=self.daemon.network, daemon=self.daemon)
-        for cmdname in known_commands:
-            self.register_method(getattr(self.cmd_runner, cmdname))
-        self.register_method(self.run_cmdline)
+        # First add always-enabled commands that are also available for "minimal" rpc server.
+        # - "ping" RPC is needed for the lockfile fd to work.
+        self.register_method('ping', self.ping)
+        # - "gui" RPC is needed for URI handling. (TODO restrict further: disallow opening arbitrary file paths)
+        self.register_method('gui', self.gui)
+        # Add other commands:
+        if not only_minimal_jsonrpc:
+            for cmdname in known_commands:
+                self.register_method(cmdname, getattr(self.cmd_runner, cmdname))
+            self.register_method('run_cmdline', self.run_cmdline)
 
     def _socket_config_str(self) -> str:
         if self.socktype == 'unix':
@@ -313,16 +334,24 @@ class CommandsServer(AuthenticatedServer):
             await site.start()
         except Exception as e:
             raise Exception(f"failed to start CommandsServer at {self._socket_config_str()}. got exc: {e!r}") from None
-        socket = site._server.sockets[0]
+        # now server has started.
+        if self.socktype == 'unix':
+            # set restrictive permissions on unix domain socket.
+            # FIXME race? we are late. should set this during socket-file creation but aiohttp API does not let us.
+            os_chmod(self.sockpath, stat.S_IREAD | stat.S_IWRITE)
+        # write server conn details into lockfile fd
         if self.socktype == 'unix':
             addr = self.sockpath
         elif self.socktype == 'tcp':
+            socket = site._server.sockets[0]
             addr = socket.getsockname()
         else:
             raise Exception(f"impossible socktype ({self.socktype!r})")
         os.write(self.fd, bytes(repr((self.socktype, addr, time.time())), 'utf8'))
         os.close(self.fd)
-        self.logger.info(f"now running and listening. socktype={self.socktype}, addr={addr}")
+        self.logger.info(
+            f"now running and listening. socktype={self.socktype}, addr={addr}. "
+            f"only_minimal_jsonrpc={self._only_minimal_jsonrpc}")
 
     async def ping(self):
         return True
@@ -333,7 +362,10 @@ class CommandsServer(AuthenticatedServer):
         #       "config_options" should have priority.
         if self.daemon.gui_object:
             if hasattr(self.daemon.gui_object, 'new_window'):
-                path = config_options.get('wallet_path') or self.config.get_wallet_path(use_gui_last_wallet=True)
+                if config_options.get(SimpleConfig.NETWORK_OFFLINE.key()) and not self.config.NETWORK_OFFLINE:
+                    raise UserFacingException(
+                        "error: current GUI is running online, so it cannot open a new wallet offline.")
+                path = config_options.get('wallet_path') or self.config.get_wallet_path()
                 self.daemon.gui_object.new_window(path, config_options.get('url'))
                 return True
             else:
@@ -343,7 +375,9 @@ class CommandsServer(AuthenticatedServer):
 
     async def run_cmdline(self, config_options):
         cmdname = config_options['cmd']
-        cmd = known_commands[cmdname]
+        cmd = known_commands.get(cmdname)
+        if not cmd:
+            return f"unknown command: {cmdname}"
         # arguments passed to function
         args = [config_options.get(x) for x in cmd.params]
         # decode json arguments
@@ -352,17 +386,15 @@ class CommandsServer(AuthenticatedServer):
         kwargs = {}
         for x in cmd.options:
             kwargs[x] = config_options.get(x)
-        if 'wallet_path' in cmd.options:
-            kwargs['wallet_path'] = config_options.get('wallet_path')
-        elif 'wallet' in cmd.options:
-            kwargs['wallet'] = config_options.get('wallet_path')
+        if 'wallet_path' in cmd.options or 'wallet' in cmd.options:
+            wallet_path = config_options.get('wallet_path')
+            if len(self.daemon._wallets) > 1 and wallet_path is None:
+                raise UserFacingException("error: wallet not specified")
+            kwargs['wallet_path'] = wallet_path
         func = getattr(self.cmd_runner, cmd.name)
         # execute requested command now.  note: cmd can raise, the caller (self.handle) will wrap it.
         result = await func(*args, **kwargs)
         return result
-
-
-
 
 
 class Daemon(Logger):
@@ -377,6 +409,7 @@ class Daemon(Logger):
         fd=None,
         *,
         listen_jsonrpc: bool = True,
+        only_minimal_jsonrpc: bool = True,
         start_network: bool = True,  # setting to False allows customising network settings before starting it
     ):
         Logger.__init__(self)
@@ -386,9 +419,6 @@ class Daemon(Logger):
             fd = get_file_descriptor(config)
             if fd is None:
                 raise Exception('failed to lock daemon; already running?')
-        if 'wallet_path' in config.cmdline_options:
-            self.logger.warning("Ignoring parameter 'wallet_path' for daemon. "
-                                "Use the load_wallet command instead.")
         self._plugins = None  # type: Optional[Plugins]
         self.asyncio_loop = util.get_asyncio_loop()
         if not self.config.NETWORK_OFFLINE:
@@ -409,7 +439,7 @@ class Daemon(Logger):
         # Setup commands server
         self.commands_server = None
         if listen_jsonrpc:
-            self.commands_server = CommandsServer(self, fd)
+            self.commands_server = CommandsServer(self, fd, only_minimal_jsonrpc=only_minimal_jsonrpc)
             asyncio.run_coroutine_threadsafe(self.taskgroup.spawn(self.commands_server.run()), self.asyncio_loop)
 
     @log_exceptions
@@ -439,13 +469,25 @@ class Daemon(Logger):
     @staticmethod
     def _wallet_key_from_path(path) -> str:
         """This does stricter path standardization than 'standardize_path'.
-        It is used for keying the _wallets dict, but not for the actual filesystem operations. (see #8495)
+        It is used for keying the _wallets dict,
+        but MUST NOT be used as a *path* for the actual filesystem operations. (see #8495)
         """
         path = standardize_path(path)
-        # also resolve symlinks and windows network mounts/etc:
-        path = os.path.realpath(path)
+        # The extra normalisation makes it even harder to open the same wallet file multiple times simultaneously.
+        # - "realpath" resolves symlinks:
+        #   note: the path returned by realpath has been observed NOT to work for FS operations!
+        #         (e.g. for Cryptomator WinFSP/FUSE mounts, see #8495).
+        #         It is okay for us to use it for computing a canonical wallet *key*, but cannot be used as a path!
+        try:
+            path = os.path.realpath(path, strict=False)
+        except OSError as e:  # see #10182
+            _logger.warning(f"could not parse {path!r}: {e!r}")
+            path = path
+        # - "normcase" does Windows-specific case and slash normalisation:
         path = os.path.normcase(path)
-        return str(path)
+        # - prepend header to break usage of wallet keys as fs paths
+        header = "WALLETKEY-"
+        return header + str(path)
 
     def with_wallet_lock(func):
         def func_wrapper(self: 'Daemon', *args, **kwargs):
@@ -454,31 +496,55 @@ class Daemon(Logger):
         return func_wrapper
 
     @with_wallet_lock
-    def load_wallet(self, path, password, *, upgrade=False) -> Optional[Abstract_Wallet]:
+    def load_wallet(
+        self,
+        path,
+        password: Optional[str],
+        *,
+        upgrade: bool = False,
+        force_check_password: bool = False,
+    ) -> Optional[Abstract_Wallet]:
+        """
+        force_check_password: if False, the password arg is only used if it needed to decrypt the storage.
+                              if True, the password arg is always validated.
+        """
+        assert password != ''
         path = standardize_path(path)
         wallet_key = self._wallet_key_from_path(path)
         # wizard will be launched if we return
         if wallet := self._wallets.get(wallet_key):
+            if force_check_password:
+                wallet.check_password(password)
+            if self.config.get('wallet_path') is None:
+                self.config.CURRENT_WALLET = path
             return wallet
-        wallet = self._load_wallet(path, password, upgrade=upgrade, config=self.config)
-        if wallet.requires_unlock():
-            wallet.unlock(password)
-        wallet.start_network(self.network)
+        wallet = self._load_wallet(
+            path, password, upgrade=upgrade, config=self.config, force_check_password=force_check_password)
+        if self.network:
+            wallet.start_network(self.network)
+        elif wallet.lnworker:
+            # in offline mode, we need to trigger callbacks
+            coro = wallet.lnworker.lnwatcher.trigger_callbacks(requires_synchronizer=False)
+            asyncio.run_coroutine_threadsafe(coro, self.asyncio_loop)
         self.add_wallet(wallet)
+        if self.config.get('wallet_path') is None:
+            self.config.CURRENT_WALLET = path
         self.update_recently_opened_wallets(path)
         return wallet
+
 
     @staticmethod
     @profiler
     def _load_wallet(
             path,
-            password,
+            password: Optional[str],
             *,
             upgrade: bool = False,
             config: SimpleConfig,
+            force_check_password: bool = False,  # if set, always validate password
     ) -> Optional[Abstract_Wallet]:
         path = standardize_path(path)
-        storage = WalletStorage(path)
+        storage = WalletStorage(path, allow_partial_writes=config.WALLET_PARTIAL_WRITES)
         if not storage.file_exists():
             raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
         if storage.is_encrypted():
@@ -490,11 +556,13 @@ class Daemon(Logger):
         if db.get_action():
             raise WalletUnfinished(db)
         wallet = Wallet(db, config=config)
+        if force_check_password:
+            wallet.check_password(password)
         return wallet
 
     @with_wallet_lock
     def add_wallet(self, wallet: Abstract_Wallet) -> None:
-        path = wallet.storage.path
+        path = wallet.storage.get_path()
         wallet_key = self._wallet_key_from_path(path)
         self._wallets[wallet_key] = wallet
         run_hook('daemon_wallet_loaded', self, wallet)
@@ -512,26 +580,48 @@ class Daemon(Logger):
         if os.path.exists(path):
             os.unlink(path)
             self.update_recently_opened_wallets(path, remove=True)
+            if self.config.CURRENT_WALLET == path:
+                self.config.CURRENT_WALLET = None
             return True
         return False
 
+    def rename_wallet_file(self, old_path: str, new_path: str):
+        old_path = standardize_path(old_path)
+        new_path = standardize_path(new_path)
+        if os.path.exists(new_path):
+            raise ValueError("Wallet file already exists")
+        os.rename(old_path, new_path)
+        self.logger.debug(f'renamed wallet: {old_path} -> {new_path}')
+        self.update_recently_opened_wallets(old_path, remove=True)
+        if self.config.CURRENT_WALLET == old_path:
+            self.config.CURRENT_WALLET = new_path
+
     def stop_wallet(self, path: str) -> bool:
         """Returns True iff a wallet was found."""
-        # note: this must not be called from the event loop. # TODO raise if so
+        assert util.get_running_loop() != util.get_asyncio_loop(), 'must not be called from asyncio thread'
         fut = asyncio.run_coroutine_threadsafe(self._stop_wallet(path), self.asyncio_loop)
         return fut.result()
 
     @with_wallet_lock
     async def _stop_wallet(self, path: str) -> bool:
         """Returns True iff a wallet was found."""
+        path = standardize_path(path)
         wallet_key = self._wallet_key_from_path(path)
         wallet = self._wallets.pop(wallet_key, None)
         if not wallet:
             return False
         await wallet.stop()
+        if self.config.get('wallet_path') is None:
+            wallet_paths = [w.storage.get_path() for w in self._wallets.values()
+                            if w.storage and w.storage.get_path()]
+            if self.config.CURRENT_WALLET == path and wallet_paths:
+                self.config.CURRENT_WALLET = wallet_paths[0]
         return True
 
     def run_daemon(self):
+        if 'wallet_path' in self.config.cmdline_options:
+            self.logger.warning("Ignoring parameter 'wallet_path' for daemon. "
+                                "Use the load_wallet command instead.")
         # init plugins
         self._plugins = Plugins(self.config, 'cmdline')
         # block until we are stopping
@@ -604,11 +694,12 @@ class Daemon(Logger):
             asyncio.run_coroutine_threadsafe(self.stop(), self.asyncio_loop).result()
 
     @with_wallet_lock
-    def _check_password_for_directory(self, *, old_password, new_password=None, wallet_dir: str) -> Tuple[bool, bool]:
+    def check_password_for_directory(self, *, old_password, new_password=None, wallet_dir: str) -> Tuple[bool, bool, list[str]]:
         """Checks password against all wallets (in dir), returns whether they can be unified and whether they are already.
         If new_password is not None, update all wallet passwords to new_password.
         """
         assert os.path.exists(wallet_dir), f"path {wallet_dir!r} does not exist"
+        succeeded = []
         failed = []
         is_unified = True
         for filename in os.listdir(wallet_dir):
@@ -617,7 +708,7 @@ class Daemon(Logger):
             if not os.path.isfile(path):
                 continue
             wallet = self.get_wallet(path)
-            # note: we only create a new wallet object if one was not loaded into the wallet already.
+            # note: we only create a new wallet object if one was not loaded into the daemon already.
             #       This is to avoid having two wallet objects contending for the same file.
             #       Take care: this only works if the daemon knows about all wallet objects.
             #                  if other code already has created a Wallet() for a file but did not tell the daemon,
@@ -647,9 +738,11 @@ class Daemon(Logger):
             if new_password:
                 self.logger.info(f'updating password for wallet: {path!r}')
                 wallet.update_password(old_password_real, new_password, encrypt_storage=True)
+            succeeded.append(path)
+
         can_be_unified = failed == []
         is_unified = can_be_unified and is_unified
-        return can_be_unified, is_unified
+        return can_be_unified, is_unified, succeeded
 
     @with_wallet_lock
     def update_password_for_directory(
@@ -665,17 +758,19 @@ class Daemon(Logger):
             return False
         if wallet_dir is None:
             wallet_dir = os.path.dirname(self.config.get_wallet_path())
-        can_be_unified, is_unified = self._check_password_for_directory(
+        can_be_unified, is_unified, _ = self.check_password_for_directory(
             old_password=old_password, new_password=None, wallet_dir=wallet_dir)
         if not can_be_unified:
             return False
         if is_unified and old_password == new_password:
             return True
-        self._check_password_for_directory(
+        self.check_password_for_directory(
             old_password=old_password, new_password=new_password, wallet_dir=wallet_dir)
         return True
 
-    def update_recently_opened_wallets(self, wallet_path, *, remove: bool = False):
+    def update_recently_opened_wallets(self, wallet_path, *, remove: bool = False) -> None:
+        if util.is_hidden_wallet_path(wallet_path):
+            return None  # don't save "hidden wallet" paths
         recent = self.config.RECENTLY_OPEN_WALLET_FILES or []
         if wallet_path in recent:
             recent.remove(wallet_path)

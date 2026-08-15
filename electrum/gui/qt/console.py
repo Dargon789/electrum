@@ -1,4 +1,3 @@
-
 # source: http://stackoverflow.com/questions/2758159/how-to-embed-a-python-interpreter-in-a-pyqt-widget
 
 import sys
@@ -6,13 +5,12 @@ import os
 import re
 import traceback
 
-from PyQt6 import QtCore
+from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
-from PyQt6 import QtGui
-from PyQt6 import QtWidgets
 
 from electrum import util
 from electrum.i18n import _
+from electrum.base_crash_reporter import taint_reports_by_console_usage
 
 from .util import MONOSPACE_FONT, font_height
 
@@ -49,17 +47,22 @@ class OverlayLabel(QtWidgets.QLabel):
 
 
 class Console(QtWidgets.QPlainTextEdit):
+    DEFAULT_FONT_SIZE = 10
+    MIN_FONT_SIZE = 6
+    MAX_FONT_SIZE = 32
+
     def __init__(self, parent=None):
         QtWidgets.QPlainTextEdit.__init__(self, parent)
 
         self.history = []
         self.namespace = {}
         self.construct = []
+        self.font_size = self.DEFAULT_FONT_SIZE
 
         self.setGeometry(50, 75, 600, 400)
         self.setWordWrapMode(QtGui.QTextOption.WrapMode.WrapAnywhere)
         self.setUndoRedoEnabled(False)
-        self.setFont(QtGui.QFont(MONOSPACE_FONT, 10, QtGui.QFont.Weight.Normal))
+        self.setFont(QtGui.QFont(MONOSPACE_FONT, self.font_size, QtGui.QFont.Weight.Normal))
         self.newPrompt("")  # make sure there is always a prompt, even before first server.banner
 
         self.updateNamespace({'run':self.run_script})
@@ -73,6 +76,11 @@ class Console(QtWidgets.QPlainTextEdit):
         )
         self.messageOverlay = OverlayLabel(warning_text, self)
 
+    def set_font_size(self, size: int):
+        size = max(self.MIN_FONT_SIZE, min(self.MAX_FONT_SIZE, size))
+        self.font_size = size
+        self.setFont(QtGui.QFont(MONOSPACE_FONT, self.font_size, QtGui.QFont.Weight.Normal))
+
     def resizeEvent(self, e):
         super().resizeEvent(e)
         vertical_scrollbar_width = self.verticalScrollBar().width() * self.verticalScrollBar().isVisible()
@@ -85,7 +93,7 @@ class Console(QtWidgets.QPlainTextEdit):
         with open(filename) as f:
             script = f.read()
 
-        self.exec_command(script)
+        self._exec_command(script)
 
     def updateNamespace(self, namespace):
         self.namespace.update(namespace)
@@ -223,14 +231,15 @@ class Console(QtWidgets.QPlainTextEdit):
         command = self.getConstruct(command)
 
         if command:
-            self.exec_command(command)
+            self._exec_command(command)
         self.newPrompt('')
         self.set_json(False)
 
-    def exec_command(self, command):
+    def _exec_command(self, command):
         tmp_stdout = sys.stdout
+        taint_reports_by_console_usage()
 
-        class stdoutProxy():
+        class StdoutProxy:
             def __init__(self, write_func):
                 self.write_func = write_func
                 self.skip = False
@@ -245,12 +254,12 @@ class Console(QtWidgets.QPlainTextEdit):
                     QtCore.QCoreApplication.processEvents()
                 self.skip = not self.skip
 
-        if type(self.namespace.get(command)) == type(lambda:None):
+        if type(self.namespace.get(command)) == type(lambda: None):
             self.appendPlainText("'{}' is a function. Type '{}()' to use it in the Python console."
                                  .format(command, command))
             return
 
-        sys.stdout = stdoutProxy(self.appendPlainText)
+        sys.stdout = StdoutProxy(self.appendPlainText)
         try:
             try:
                 # eval is generally considered bad practice. use it wisely!
@@ -308,6 +317,12 @@ class Console(QtWidgets.QPlainTextEdit):
         elif event.key() == Qt.Key.Key_C and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             if not self.textCursor().selectedText():
                 self.keyboard_interrupt()
+        elif event.key() == Qt.Key.Key_Plus and Qt.KeyboardModifier.ControlModifier in event.modifiers():
+            self.set_font_size(self.font_size + 1)
+            return
+        elif event.key() == Qt.Key.Key_Minus and Qt.KeyboardModifier.ControlModifier in event.modifiers():
+            self.set_font_size(self.font_size - 1)
+            return
 
         super(Console, self).keyPressEvent(event)
 

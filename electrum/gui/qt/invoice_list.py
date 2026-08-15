@@ -26,14 +26,14 @@
 import enum
 from typing import Sequence, TYPE_CHECKING
 
-from PyQt6.QtCore import Qt, QItemSelectionModel
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QStandardItemModel, QStandardItem
 from PyQt6.QtWidgets import QAbstractItemView
 from PyQt6.QtWidgets import QMenu, QVBoxLayout, QTreeWidget, QTreeWidgetItem, QHeaderView
 
 from electrum.i18n import _
 from electrum.util import format_time
-from electrum.invoices import Invoice, PR_UNPAID, PR_PAID, PR_INFLIGHT, PR_FAILED
+from electrum.invoices import PR_UNPAID, PR_INFLIGHT, PR_FAILED
 from electrum.lnutil import HtlcLog
 
 from .util import read_QIcon, pr_icons
@@ -43,7 +43,6 @@ from .util import WindowModalDialog
 from .my_treeview import MyTreeView, MySortModel
 
 if TYPE_CHECKING:
-    from .main_window import ElectrumWindow
     from .send_tab import SendTab
 
 
@@ -115,8 +114,6 @@ class InvoiceList(MyTreeView):
                 icon_name = 'lightning.png'
             else:
                 icon_name = 'bitcoin.png'
-                if item.bip70:
-                    icon_name = 'seal.png'
             status = self.wallet.get_invoice_status(item)
             amount = item.get_amount_sat()
             amount_str = self.main_window.format_amount(amount, whitespaces=True) if amount else ""
@@ -144,6 +141,9 @@ class InvoiceList(MyTreeView):
 
     def show_invoice(self, key):
         invoice = self.wallet.get_invoice(key)
+        if not invoice:
+            self.update()
+            return
         if invoice.is_lightning():
             self.main_window.show_lightning_invoice(invoice)
         else:
@@ -157,7 +157,7 @@ class InvoiceList(MyTreeView):
     def create_menu(self, position):
         wallet = self.wallet
         items = self.selected_in_column(0)
-        if len(items)>1:
+        if len(items) > 1:
             keys = [item.data(ROLE_REQUEST_ID) for item in items]
             invoices = [wallet.get_invoice(key) for key in keys]
             can_batch_pay = all([not i.is_lightning() and wallet.get_invoice_status(i) == PR_UNPAID for i in invoices])
@@ -193,7 +193,7 @@ class InvoiceList(MyTreeView):
             if log:
                 menu.addAction(_("View log"), lambda: self.show_log(key, log))
         menu.addAction(_("Delete"), lambda: self.delete_invoices([key]))
-        menu.exec(self.viewport().mapToGlobal(position))
+        self.open_menu(menu, position)
 
     def show_log(self, key, log: Sequence[HtlcLog]):
         d = WindowModalDialog(self, _("Payment log"))

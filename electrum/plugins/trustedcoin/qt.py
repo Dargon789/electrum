@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (QTextEdit, QVBoxLayout, QLabel, QGridLayout, QHBoxL
 
 from electrum.i18n import _
 from electrum.plugin import hook
-from electrum.util import InvalidPassword
+from electrum.util import InvalidPassword, ChoiceItem
 from electrum.logging import Logger, get_logger
 from electrum import keystore
 
@@ -250,12 +250,24 @@ class Plugin(TrustedCoinPlugin):
                 'gui': WCCreateSeed,
                 'params': {'icon': self.icon_path('trustedcoin-wizard.png')},
             },
+            'trustedcoin_create_ext': {
+                'gui': WCEnterExt,
+                'params': {'icon': self.icon_path('trustedcoin-wizard.png')},
+            },
             'trustedcoin_confirm_seed': {
                 'gui': WCConfirmSeed,
                 'params': {'icon': self.icon_path('trustedcoin-wizard.png')},
             },
+            'trustedcoin_confirm_ext': {
+                'gui': WCConfirmExt,
+                'params': {'icon': self.icon_path('trustedcoin-wizard.png')},
+            },
             'trustedcoin_have_seed': {
                 'gui': WCHaveSeed,
+                'params': {'icon': self.icon_path('trustedcoin-wizard.png')},
+            },
+            'trustedcoin_have_ext': {
+                'gui': WCEnterExt,
                 'params': {'icon': self.icon_path('trustedcoin-wizard.png')},
             },
             'trustedcoin_keep_disable': {
@@ -276,35 +288,6 @@ class Plugin(TrustedCoinPlugin):
             }
         }
         wizard.navmap_merge(views)
-
-        # modify default flow, insert seed extension entry/confirm as separate views
-        ext = {
-            'trustedcoin_create_seed': {
-                'next': lambda d: 'trustedcoin_create_ext' if wizard.wants_ext(d) else 'trustedcoin_confirm_seed'
-            },
-            'trustedcoin_create_ext': {
-                'gui': WCEnterExt,
-                'params': {'icon': self.icon_path('trustedcoin-wizard.png')},
-                'next': 'trustedcoin_confirm_seed',
-            },
-            'trustedcoin_confirm_seed': {
-                'next': lambda d: 'trustedcoin_confirm_ext' if wizard.wants_ext(d) else 'trustedcoin_tos'
-            },
-            'trustedcoin_confirm_ext': {
-                'gui': WCConfirmExt,
-                'params': {'icon': self.icon_path('trustedcoin-wizard.png')},
-                'next': 'trustedcoin_tos',
-            },
-            'trustedcoin_have_seed': {
-                'next': lambda d: 'trustedcoin_have_ext' if wizard.wants_ext(d) else 'trustedcoin_keep_disable'
-            },
-            'trustedcoin_have_ext': {
-                'gui': WCEnterExt,
-                'params': {'icon': self.icon_path('trustedcoin-wizard.png')},
-                'next': 'trustedcoin_keep_disable',
-            },
-        }
-        wizard.navmap_merge(ext)
 
         # insert page offering choice to go online or continue on another system
         ext_online = {
@@ -357,8 +340,8 @@ class WCChooseSeed(WalletWizardComponent):
         WalletWizardComponent.__init__(self, parent, wizard, title=_('Create or restore'))
         message = _('Do you want to create a new seed, or restore a wallet using an existing seed?')
         choices = [
-            ('createseed',  _('Create a new seed')),
-            ('haveseed',    _('I already have a seed')),
+            ChoiceItem(key='createseed', label=_('Create a new seed')),
+            ChoiceItem(key='haveseed', label=_('I already have a seed')),
         ]
 
         self.choice_w = ChoiceWidget(message=message, choices=choices)
@@ -477,6 +460,18 @@ class WCShowConfirmOTP(WalletWizardComponent):
         self.wizard.trustedcoin_qhelper.otpError.connect(self.on_otp_error)
         self.wizard.trustedcoin_qhelper.remoteKeyError.connect(self.on_remote_key_error)
 
+        # set higher minHeight so the qr code and the input field are shown without scrolling
+        prev_height = self.wizard.height()
+        prev_min_height = self.wizard.minimumHeight()
+        def restore_prev_height():
+            self.wizard.setMinimumHeight(prev_min_height)
+            self.wizard.resize(self.wizard.width(), prev_height)
+            self.wizard.next_button.clicked.disconnect(restore_prev_height)
+            self.wizard.back_button.clicked.disconnect(restore_prev_height)
+        self.wizard.setMinimumHeight(530)
+        self.wizard.next_button.clicked.connect(restore_prev_height)
+        self.wizard.back_button.clicked.connect(restore_prev_height)
+
         self._is_online_continuation = 'seed' not in self.wizard_data
         if self._is_online_continuation:
             self.knownsecretlabel.setText(_('Authenticate below to finalize wallet creation'))
@@ -563,10 +558,9 @@ class WCKeepDisable(WalletWizardComponent):
             'or do you want to disable it, and have two master private keys in your wallet?'
         ])
         choices = [
-            ('keep',    _('Keep')),
-            ('disable', _('Disable')),
+            ChoiceItem(key='keep', label=_('Keep')),
+            ChoiceItem(key='disable', label=_('Disable')),
         ]
-
         self.choice_w = ChoiceWidget(message=message, choices=choices)
         self.layout().addWidget(self.choice_w)
         self.layout().addStretch(1)

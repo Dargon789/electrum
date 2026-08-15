@@ -2,7 +2,7 @@
 # from https://docs.appimage.org/introduction/concepts.html :
 # "[AppImages] should be built on the oldest possible system, allowing them to run on newer system[s]"
 
-FROM debian:buster@sha256:233c3bbc892229c82da7231980d50adceba4db56a08c0b7053a4852782703459
+FROM debian:bullseye@sha256:cf48c31af360e1c0a0aedd33aae4d928b68c2cdf093f1612650eb1ff434d1c34
 
 ENV LC_ALL=C.UTF-8 LANG=C.UTF-8
 ENV DEBIAN_FRONTEND=noninteractive
@@ -20,6 +20,7 @@ RUN apt-get update -q && \
         sudo \
         git \
         wget \
+        python3 \
         make \
         autotools-dev \
         autoconf \
@@ -57,8 +58,7 @@ RUN apt-get update -q && \
         libxcb-icccm4 \
         libxcb-image0 \
         libxcb-keysyms1 \
-        libxcb-util0 \
-        #libxcb-util1 \
+        libxcb-util1 \
         libxcb-render-util0 \
         libxcb-cursor0 \
         libx11-xcb1 \
@@ -68,6 +68,7 @@ RUN apt-get update -q && \
         libv4l-dev \
         libjpeg62-turbo-dev \
         libx11-dev \
+        desktop-file-utils \
         && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get autoremove -y && \
@@ -75,13 +76,12 @@ RUN apt-get update -q && \
 
 # create new user to avoid using root; but with sudo access and no password for convenience.
 ARG UID=1000
-ENV USER="user"
-ENV HOME_DIR="/home/${USER}"
-ENV WORK_DIR="${HOME_DIR}/wspace" \
-    PATH="${HOME_DIR}/.local/bin:${PATH}"
-RUN useradd --uid $UID --create-home --shell /bin/bash ${USER}
-RUN usermod -append --groups sudo ${USER}
+RUN useradd -u "$UID" -m -s /usr/bin/bash -d /home/user user
+RUN usermod -aG sudo user
 RUN echo "%sudo ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+ENV HOME_DIR=/home/user
+ENV WORK_DIR="${HOME_DIR}/wspace"
+ENV PATH="${HOME_DIR}/.local/bin:${PATH}"
 WORKDIR ${WORK_DIR}
-RUN chown --recursive ${USER} ${WORK_DIR}
-USER ${USER}
+RUN chown -R user ${WORK_DIR}
+USER user
